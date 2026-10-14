@@ -290,18 +290,46 @@ MiMo 网页版接口**原生不支持** `tools` 参数，本代理用**提示词
 ```
 <tool_call>
 <function=glob>
-<parameter=pattern>src/**/*.ts</parameter>
+<parameter=pattern>"src/**/*.ts"</parameter>
 </function>
 </tool_call>
 ```
 
-**容错格式**——模型有时会用 JSON：
+**容错格式**——模型实际输出可能偏离约定，以下都能识别：
 
-```json
-{"name": "glob", "arguments": {"pattern": "src/**/*.ts"}}
-```
+| 格式 | 示例 |
+|---|---|
+| 工具名作标签 | `<tool_call><pwsh><parameter=command>ls</parameter></pwsh></tool_call>` |
+| function 内容式 | `<tool_call><function>pwsh</function>...</tool_call>` |
+| 参数用 name 属性 | `<parameter name="command">ls</parameter>` |
+| 自闭合参数 | `<parameter name="command" value="ls" />` |
+| JSON 参数块 | `<arguments>{"command":"ls"}</arguments>` |
+| markdown JSON | ```` ```json {"name":"glob","arguments":{...}} ``` ```` |
+| 裸 JSON | `{"name":"glob","arguments":{...}}` |
 
-（代码块包裹或裸 JSON 都能识别）
+### 参数书写规则
+
+提示词要求模型遵守以下规则（提高客户端兼容性）：
+
+| 规则 | 原因 |
+|---|---|
+| **含空格的值用双引号包裹** | 部分客户端把参数拼进命令行，不加引号会被空格截断 |
+| 无空格的值不加引号 | 保持类型推断（`42` 是数字而非字符串） |
+| 反斜杠路径改正斜杠 | 避免转义问题 |
+
+解析器会自动去掉包裹引号，**内部空格完整保留**。
+
+### 工具名校正
+
+模型偶尔会改写工具名（首字母大写、拼写错误）。本代理会**自动校正**：
+
+| 模型输出 | 校正为 | 策略 |
+|---|---|---|
+| `Glob` | `glob` | 忽略大小写 |
+| `get_file` | `getFile` | 忽略下划线/连字符 |
+| `pwdsh` | `pwsh` | 编辑距离模糊匹配 |
+
+**只在唯一命中时校正**；有歧义时保持原样，让客户端报明确错误。
 
 ### 行为说明
 
@@ -310,8 +338,6 @@ MiMo 网页版接口**原生不支持** `tools` 参数，本代理用**提示词
 | 模型决定调用工具 | `finish_reason: "tool_calls"`，`message.tool_calls` 有值，`content` 为 `null` |
 | 模型直接回答 | `finish_reason: "stop"`，正常文本 |
 | 同时有正文和工具调用 | 正文放 `content`，工具调用放 `tool_calls` |
-
-**参数类型自动推断**：`42` → 数字、`true` → 布尔、`{...}` → 对象、其余为字符串。
 
 ### 注意事项
 
@@ -322,8 +348,12 @@ MiMo 网页版接口**原生不支持** `tools` 参数，本代理用**提示词
 ### 测试
 
 ```bash
-node --experimental-strip-types test/tool-calls.test.ts   # 35 项
-node scripts/test-tools-e2e.mjs                           # 端到端
+node --experimental-strip-types test/tool-calls.test.ts        # 35 项：格式解析
+node --experimental-strip-types test/tool-name-match.test.ts   # 27 项：名称校正
+node --experimental-strip-types test/tool-xml-variant.test.ts  # 12 项：XML 变体
+node --experimental-strip-types test/tool-path.test.ts         # 15 项：路径与引号
+node scripts/test-tools-e2e.mjs                                # 端到端
+node scripts/test-tool-names.mjs                               # 名称校正端到端
 ```
 
 ---
@@ -588,7 +618,10 @@ rm -f data/mimo.db data/mimo.db-shm data/mimo.db-wal
 ├── test/
 │   ├── think-parser.test.ts       # 思考链解析测试（22 项）
 │   ├── parse-credential.test.ts   # 凭证解析测试（16 项）
-│   └── tool-calls.test.ts         # 工具调用解析测试（35 项）
+│   ├── tool-calls.test.ts         # 工具调用格式解析（35 项）
+│   ├── tool-name-match.test.ts    # 工具名校正（27 项）
+│   ├── tool-xml-variant.test.ts   # XML 变体格式（12 项）
+│   └── tool-path.test.ts          # 路径与引号处理（15 项）
 ├── scripts/                # 安装、部署、诊断与验证脚本
 ├── docs/
 │   ├── 协议逆向报告.md      # 上游协议分析
@@ -604,16 +637,20 @@ rm -f data/mimo.db data/mimo.db-shm data/mimo.db-wal
 ## 测试
 
 ```bash
-# 单元测试（共 73 项）
-node --experimental-strip-types test/think-parser.test.ts      # 22 项：思考链分片解析
-node --experimental-strip-types test/parse-credential.test.ts  # 16 项：cURL/凭证解析
-node --experimental-strip-types test/tool-calls.test.ts        # 35 项：工具调用解析
+# 单元测试（共 127 项）
+node --experimental-strip-types test/think-parser.test.ts       # 22 项：思考链分片解析
+node --experimental-strip-types test/parse-credential.test.ts   # 16 项：cURL/凭证解析
+node --experimental-strip-types test/tool-calls.test.ts         # 35 项：工具调用格式
+node --experimental-strip-types test/tool-name-match.test.ts    # 27 项：工具名校正
+node --experimental-strip-types test/tool-xml-variant.test.ts   # 12 项：XML 变体
+node --experimental-strip-types test/tool-path.test.ts          # 15 项：路径与引号
 
 # 端到端（需服务运行中）
 node scripts/test-tools-e2e.mjs            # 工具调用
+node scripts/test-tool-names.mjs           # 工具名校正
 node scripts/check-stream-health.mjs       # 流式健康
 node scripts/check-sse-format.mjs          # SSE 格式校验
-node scripts/final-acceptance.sh           # 完整验收
+bash scripts/final-acceptance.sh           # 完整验收
 ```
 
 ---

@@ -42,7 +42,8 @@ export interface ParsedToolCall {
  * 关键设计：
  *   - 用简洁明确的格式说明，降低模型格式错误率
  *   - 给出完整示例（模型对示例的模仿率最高）
- *   - 强调「不要用 markdown 代码块包裹」
+ *   - **对含空格的值要求加引号**：许多客户端会把参数拼进命令行，
+ *     不加引号的路径会被空格截断（例如 `F:\code\lsp Ksu` 变成 `F:\code\lsp`）
  */
 export function buildToolPrompt(tools: ToolDefinition[]): string {
   const defs = tools
@@ -77,23 +78,54 @@ XML 格式输出，不要使用 markdown 代码块，不要添加额外说明文
 </function>
 </tool_call>
 
-## 规则
+## 参数值书写规则（重要）
 
-1. 一次可以输出多个 <tool_call> 块
-2. 参数值直接写内容，不要加引号或转义（除非内容本身包含 XML 特殊字符）
+1. **凡是可能包含空格的值（路径、命令、查询语句），必须用英文双引号包裹**。
+   这是为了避免下游按空格拆分参数导致内容被截断。
+
+   ✅ 正确：<parameter=path>"F:/my docs/lsp Ksu"</parameter>
+   ❌ 错误：<parameter=path>F:/my docs/lsp Ksu</parameter>
+
+2. 不含空格的值（单个词、数字、布尔值）**不要**加引号。
+
+   ✅ 正确：<parameter=count>5</parameter>
+   ✅ 正确：<parameter=enabled>true</parameter>
+
+3. 反斜杠路径请统一改为正斜杠，避免转义问题。
+
+   ✅ 推荐：<parameter=path>"F:/code/lsp Ksu"</parameter>
+   ⚠️ 避免：<parameter=path>"F:\\code\\lsp Ksu"</parameter>
+
+## 其他规则
+
+1. **工具名称必须与下方「可用工具」中列出的完全一致，区分大小写**。
+   不要改写、不要首字母大写、不要翻译。
+2. 一次可以输出多个 <tool_call> 块
 3. 调用工具时，**只输出 XML**，不要在前后添加解释性文字
 4. 参数必须符合下方 schema 定义
 5. 如果不需要调用工具，正常回答即可
 
 ## 示例
 
-用户问「读取 package.json 文件」时，你应输出：
+假设可用工具里有名为 \`read_file\` 和 \`list_dir\` 的工具，
+用户说「读取 F:\\code\\lsp Ksu 这个目录」时，你应输出：
+
+<tool_call>
+<function=list_dir>
+<parameter=path>"F:/code/lsp Ksu"</parameter>
+</function>
+</tool_call>
+
+用户说「读取 package.json」时（无空格，不加引号）：
 
 <tool_call>
 <function=read_file>
-<parameter=path>package.json</parameter>
+<parameter=file_path>package.json</parameter>
 </function>
 </tool_call>
+
+> 注意示例中的 \`list_dir\` / \`read_file\` 只是**名称格式示意**。
+> 实际调用时，请使用下方「可用工具」里真实存在的名称。
 
 ## 可用工具
 
@@ -113,13 +145,24 @@ function makeId(index: number): string {
 /**
  * 解析格式 A：XML 风格
  *
+ * 主格式：
  * <tool_call>
  * <function=名称>
  * <parameter=键>值</parameter>
  * </function>
  * </tool_call>
+ *
+ * 变体（模型有时把函数名直接当标签名）：
+ * <tool_call>
+ * <pwsh>
+ * <parameter=command>...</parameter>
+ * </pwsh>
+ * </tool_call>
+ *
+ * @param text        模型输出
+ * @param validNames  客户端注册的工具名，用于识别「标签名即函数名」的变体
  */
-function parseXmlToolCalls(text: string): ParsedToolCall[] {
+function parseXmlToolCalls(text: string, validNames?: string[]): ParsedToolCall[] {
   const calls: ParsedToolCall[] = [];
 
   // 匹配每个 <tool_call>...</tool_call> 块
@@ -129,13 +172,45 @@ function parseXmlToolCalls(text: string): ParsedToolCall[] {
   while ((blockMatch = blockRe.exec(text)) !== null) {
     const block = blockMatch[1];
 
-    // 提取函数名：<function=名称> 或 <function name="名称">
     let fnName = '';
+
+    // ---- 形式 1：<function=名称> 或 <function name="名称"> ----
     const nameMatch =
       block.match(/<function=([^>\s]+)/i) ??
-      block.match(/<function\s+name=["']([^"']+)["']/i) ??
-      block.match(/<function>([\s\S]*?)<\/function>/i);
+      block.match(/<function\s+name=["']([^"']+)["']/i);
     if (nameMatch) fnName = nameMatch[1].trim();
+
+    // ---- 形式 2：<function>名称</function> ----
+    if (!fnName) {
+      const inner = block.match(/<function>([\s\S]*?)<\/function>/i);
+      if (inner) {
+        const t = inner[1].trim();
+        // 只有当内容里没有 parameter 标签时，才认为它是函数名
+        if (t && !/<parameter=/i.test(t)) fnName = t;
+      }
+    }
+
+    // ---- 形式 3：直接用工具名作标签，如 <pwsh>...</pwsh> ----
+    if (!fnName && validNames?.length) {
+      // 找出块内所有形如 <xxx> 的开标签（排除已知的结构标签）
+      const reserved = new Set([
+        'tool_call', 'function', 'parameter', 'parameters',
+        'arguments', 'args', 'invoke', 'tool',
+      ]);
+      const tagRe = /<([A-Za-z_][\w.-]*)(?:\s[^>]*)?>/g;
+      let tm: RegExpExecArray | null;
+      while ((tm = tagRe.exec(block)) !== null) {
+        const tag = tm[1];
+        if (reserved.has(tag.toLowerCase())) continue;
+        // 该标签名是否匹配某个已注册工具
+        const matched = matchToolName(tag, validNames);
+        if (matched) {
+          fnName = matched;
+          break;
+        }
+      }
+    }
+
     if (!fnName) continue;
 
     // 提取参数
@@ -146,6 +221,36 @@ function parseXmlToolCalls(text: string): ParsedToolCall[] {
       const key = pMatch[1].trim();
       const raw = pMatch[2];
       args[key] = coerceValue(raw);
+    }
+
+    // 变体：<parameter name="x">值</parameter>
+    const paramRe2 = /<parameter\s+name=["']([^"']+)["']>([\s\S]*?)<\/parameter>/gi;
+    while ((pMatch = paramRe2.exec(block)) !== null) {
+      const key = pMatch[1].trim();
+      if (!(key in args)) args[key] = coerceValue(pMatch[2]);
+    }
+
+    // 变体：<parameter name="x" value="值" />（自闭合）
+    const paramRe3 = /<parameter\s+name=["']([^"']+)["']\s+value=["']([^"']*)["']\s*\/?>/gi;
+    while ((pMatch = paramRe3.exec(block)) !== null) {
+      const key = pMatch[1].trim();
+      if (!(key in args)) args[key] = coerceValue(pMatch[2]);
+    }
+
+    // 变体：直接 JSON 参数块
+    if (!Object.keys(args).length) {
+      const jsonArgs = block.match(/<arguments>\s*([\s\S]*?)\s*<\/arguments>/i)
+        ?? block.match(/<parameters>\s*([\s\S]*?)\s*<\/parameters>/i);
+      if (jsonArgs) {
+        try {
+          const parsed = JSON.parse(jsonArgs[1].trim());
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            Object.assign(args, parsed as Record<string, unknown>);
+          }
+        } catch {
+          /* 保持空参数 */
+        }
+      }
     }
 
     calls.push({
@@ -215,58 +320,179 @@ function parseJsonToolCalls(text: string): ParsedToolCall[] {
  *
  * 模型输出 `<parameter=count>5</parameter>` 时，
  * 期望得到数字 5 而不是字符串 "5"。
+ *
+ * 同时处理提示词要求的「含空格值加引号」——
+ * 引号仅作包裹用途，解析后要去掉，但**内部空格必须保留**。
  */
 function coerceValue(raw: string): unknown {
   const v = raw.trim();
 
-  // 去掉可能的包裹引号
-  const unquoted = v.replace(/^["']|["']$/g, '');
-
   if (v === '') return '';
+
+  // 布尔
   if (/^(true|false)$/i.test(v)) return v.toLowerCase() === 'true';
-  if (/^-?\d+$/.test(v)) {
-    const n = Number(v);
-    return Number.isSafeInteger(n) ? n : v;
-  }
-  if (/^-?\d*\.\d+$/.test(v)) return Number(v);
   if (/^(null|undefined)$/i.test(v)) return null;
 
+  // 数字（注意：带引号的 "42" 应视为字符串，保持模型意图）
+  const isQuoted = /^["'][\s\S]*["']$/.test(v) && v.length >= 2;
+  if (!isQuoted) {
+    if (/^-?\d+$/.test(v)) {
+      const n = Number(v);
+      return Number.isSafeInteger(n) ? n : v;
+    }
+    if (/^-?\d*\.\d+$/.test(v)) return Number(v);
+  }
+
+  // 去掉包裹引号（只去最外层一对，内部内容原样保留）
+  let inner = v;
+  if (isQuoted) {
+    inner = v.slice(1, -1);
+  }
+
   // JSON 对象/数组
-  if (/^[[{]/.test(v)) {
+  if (/^[[{]/.test(inner)) {
     try {
-      return JSON.parse(v);
+      return JSON.parse(inner);
     } catch {
       /* 保持字符串 */
     }
   }
 
-  return unquoted;
+  return inner;
 }
 
 /**
  * 从模型输出中解析工具调用。
  *
  * 会依次尝试 XML 与 JSON 两种格式，返回首个成功的解析结果。
+ *
+ * @param text         模型输出文本
+ * @param validNames   客户端注册的工具名列表。传入时会做名称校正：
+ *                     模型偶尔会把名称首字母大写或改变大小写，
+ *                     这里按「忽略大小写唯一匹配」自动修正，
+ *                     避免客户端报 unknown tool。
  */
-export function parseToolCalls(text: string): ParsedToolCall[] {
+export function parseToolCalls(
+  text: string,
+  validNames?: string[],
+): ParsedToolCall[] {
   if (!text) return [];
+
+  let calls: ParsedToolCall[] = [];
 
   // 优先 XML（提示词里约定的主格式）
   if (/<tool_call>/i.test(text)) {
-    const xml = parseXmlToolCalls(text);
-    if (xml.length) return xml;
+    calls = parseXmlToolCalls(text, validNames);
   }
 
   // 回退 JSON
-  const json = parseJsonToolCalls(text);
-  if (json.length) return json;
+  if (!calls.length) {
+    calls = parseJsonToolCalls(text);
+  }
 
-  return [];
+  if (!calls.length) return [];
+
+  // 名称校正
+  if (validNames?.length) {
+    for (const c of calls) {
+      const fixed = matchToolName(c.function.name, validNames);
+      if (fixed && fixed !== c.function.name) {
+        console.warn(
+          `[工具] 名称校正: "${c.function.name}" → "${fixed}"`,
+        );
+        c.function.name = fixed;
+      }
+    }
+  }
+
+  return calls;
+}
+
+/**
+ * 把模型输出的工具名匹配到客户端注册的名称。
+ *
+ * 策略（从严格到宽松，一旦唯一命中即返回）：
+ *   1. 精确匹配
+ *   2. 忽略大小写唯一匹配        Glob → glob
+ *   3. 忽略下划线/连字符唯一匹配  get_file → getFile
+ *   4. 编辑距离足够近且唯一        pwdsh → pwsh（模型拼写错误）
+ *   5. 无法唯一确定 → null（保持原样，让客户端报错更明确）
+ */
+export function matchToolName(
+  name: string,
+  validNames: string[],
+): string | null {
+  if (!name) return null;
+
+  // 1. 精确
+  if (validNames.includes(name)) return name;
+
+  const lower = name.toLowerCase();
+
+  // 2. 忽略大小写
+  const ci = validNames.filter((v) => v.toLowerCase() === lower);
+  if (ci.length === 1) return ci[0];
+
+  // 3. 忽略分隔符（下划线/连字符）
+  const norm = (s: string) => s.toLowerCase().replace(/[_-]/g, '');
+  const target = norm(name);
+  const loose = validNames.filter((v) => norm(v) === target);
+  if (loose.length === 1) return loose[0];
+
+  // 4. 模糊匹配：编辑距离
+  //
+  // 只对长度足够（≥3）的名称启用，避免短名称之间误配。
+  // 允许的最大距离按长度自适应：短名称 1，长名称 2。
+  if (target.length >= 3) {
+    const maxDist = target.length >= 6 ? 2 : 1;
+    const near = validNames.filter((v) => {
+      const d = editDistance(target, norm(v));
+      return d > 0 && d <= maxDist;
+    });
+    if (near.length === 1) return near[0];
+  }
+
+  return null;
+}
+
+/**
+ * Levenshtein 编辑距离（迭代实现，带滚动数组）。
+ *
+ * 用于识别模型输出的轻微拼写错误，例如 pwdsh → pwsh。
+ */
+export function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+
+  let prev = new Array<number>(b.length + 1);
+  let curr = new Array<number>(b.length + 1);
+
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(
+        prev[j] + 1,      // 删除
+        curr[j - 1] + 1,  // 插入
+        prev[j - 1] + cost, // 替换
+      );
+    }
+    [prev, curr] = [curr, prev];
+  }
+
+  return prev[b.length];
 }
 
 /** 文本中是否含有工具调用标记 */
 export function hasToolCall(text: string): boolean {
-  return /<tool_call>/i.test(text) || /```(?:json)?\s*\{\s*"(?:name|function)"/i.test(text);
+  if (/<tool_call>/i.test(text)) return true;
+  if (/```(?:json)?\s*\{\s*"(?:name|function)"/i.test(text)) return true;
+  // 裸 JSON 对象形态
+  if (/\{\s*"(?:name|function)"\s*:/.test(text)) return true;
+  return false;
 }
 
 /**

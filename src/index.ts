@@ -453,6 +453,11 @@ async function runChatOnce(
       ? (body.tools as ToolDefinition[])
       : null;
 
+    // 客户端注册的工具名，用于校正模型输出的大小写偏差
+    const toolNames = tools
+      ? tools.map((t) => t?.function?.name).filter((n): n is string => !!n)
+      : [];
+
     const messagesForUpstream: ChatMessage[] = tools
       ? injectToolPrompt(rawMessages, tools)
       : rawMessages;
@@ -553,7 +558,7 @@ async function runChatOnce(
           if (useTools) {
             // ---- 处理工具调用 ----
             const calls = hasToolCall(answerBuffer)
-              ? parseToolCalls(answerBuffer)
+              ? parseToolCalls(answerBuffer, toolNames)
               : [];
 
             if (calls.length) {
@@ -683,7 +688,7 @@ async function runChatOnce(
     // ---- 工具调用解析（非流式）----
     let toolCalls: ParsedToolCall[] = [];
     if (tools && hasToolCall(finalText)) {
-      toolCalls = parseToolCalls(finalText);
+      toolCalls = parseToolCalls(finalText, toolNames);
       if (toolCalls.length) {
         console.log(
           `[工具] 解析到 ${toolCalls.length} 个调用: ${toolCallNames(toolCalls).join(', ')}`,

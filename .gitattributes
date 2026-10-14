@@ -1,0 +1,36 @@
+# 统一换行符与编码，避免跨平台差异
+* text=auto eol=lf
+
+# 源码
+*.ts   text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.css  text eol=lf
+*.md   text eol=lf
+
+# Shell 脚本必须 LF，否则 WSL/Linux 下无法执行
+*.sh   text eol=lf
+mimoapi text eol=lf
+
+# Windows 脚本用 CRLF
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# 二进制
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.db   binary
+*.woff binary
+*.woff2 binary
+
+# 明确标记语言，便于 GitHub 语法高亮
+*.ts   linguist-language=TypeScript
+*.mjs  linguist-language=JavaScript
+
+# 统计时排除（不算作代码行）
+package-lock.json  -diff linguist-generated
+docs/screenshots/* linguist-documentation

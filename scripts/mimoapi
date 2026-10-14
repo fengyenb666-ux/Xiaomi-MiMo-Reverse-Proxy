@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+#
+# mimoapi —— MiMo 反向代理启动器
+#
+# 用法:
+#   mimoapi              启动服务（前台）
+#   mimoapi start        后台启动
+#   mimoapi stop         停止后台服务
+#   mimoapi restart      重启
+#   mimoapi status       查看状态
+#   mimoapi logs         查看后台日志
+#   mimoapi build        重新构建
+#   mimoapi update       从 Windows 侧同步代码并重建
+#   mimoapi help         帮助
+#
+set -uo pipefail
+
+# 注意：这里刻意「不使用」set -e。
+# 本脚本大量使用 `[ 条件 ] && 命令` 这种「条件为假即返回 1」的写法，
+# 若开启 set -e，脚本会在这些位置静默中止——表现为「输入命令后毫无反应」。
+# 关键步骤均已各自做显式错误处理，不依赖 set -e。
+
+APP_DIR="$HOME/mimoapi"
+PID_FILE="$APP_DIR/data/mimoapi.pid"
+LOG_FILE="$APP_DIR/data/mimoapi.log"
+PORT="${PORT:-8788}"
+SRC_WIN="/mnt/f/code/反代MIMO"
+
+# 确保使用我们安装的 Node
+export PATH="$HOME/.local/bin:$PATH"
+
+# 避免继承 Windows 侧失效的代理设置
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY 2>/dev/null || true
+
+# Chromium 相关环境变量（让项目内的自动抓取能找到浏览器）
+export MIMO_BROWSER_PATH="${MIMO_BROWSER_PATH:-$HOME/.local/chromium/chrome-linux/chrome}"
+export LD_LIBRARY_PATH="$HOME/.local/chromium-libs/lib:${LD_LIBRARY_PATH:-}"
+
+cd "$APP_DIR" 2>/dev/null || {
+  echo "❌ 找不到项目目录: $APP_DIR"
+  echo "   请先运行部署脚本"
+  exit 1
+}
+
+# 检查依赖与构建
+check_ready() {
+  if [ ! -d node_modules ]; then
+    echo "⚠️  依赖未安装，正在安装..."
+    npm install --no-audit --no-fund
+  fi
+  if [ ! -f dist/index.js ]; then
+    echo "⚠️  未构建，正在构建..."
+    npm run build
+  fi
+}
+
+# 判断服务是否在运行
+# 优先看 PID 文件；PID 文件丢失时回退到端口探测（更健壮）
+is_running() {
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$PID_FILE"
+  fi
+
+  # 回退：按端口查找监听进程
+  local port_pid
+  port_pid=$(find_port_pid)
+  if [ -n "$port_pid" ]; then
+    echo "$port_pid" > "$PID_FILE"   # 补写 PID 文件
+    return 0
+  fi
+
+  return 1
+}
+
+# 查找占用端口的进程 PID
+#
+# 注意：`ss -p` 在非 root 下常看不到其他进程的 pid（Process 列为空），
+# 因此这里依次尝试多种工具，任一可用即可。
+find_port_pid() {
+  local pid=""
+
+  # 1) ss：仅当能解析出 pid 时才采用
+  if command -v ss >/dev/null 2>&1; then
+    pid=$(ss -lptn "sport = :$PORT" 2>/dev/null \
+      | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+  fi
+
+  # 2) lsof（对普通用户自己的进程有效）
+  if [ -z "$pid" ] && command -v lsof >/dev/null 2>&1; then
+    pid=$(lsof -ti ":$PORT" -sTCP:LISTEN 2>/dev/null | head -1)
+  fi
+
+  # 3) fuser
+  if [ -z "$pid" ] && command -v fuser >/dev/null 2>&1; then
+    pid=$(fuser "$PORT/tcp" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -1)
+  fi
+
+  # 4) 兜底：查找真正在运行的 node 进程
+  #
+  # 两个坑：
+  #   a) pgrep -f 会匹配到执行中的 shell 脚本（其内容含 "dist/index.js"）
+  #   b) Node 24 的 /proc/PID/comm 可能是 "MainThread" 而不是 "node"
+  # 因此改为读 cmdline 判断，并排除脚本自身。
+  if [ -z "$pid" ]; then
+    local p cmd
+    for p in $(pgrep -f "dist/index\.js" 2>/dev/null || true); do
+      # 跳过自身与父进程
+      if [ "$p" = "$$" ] || [ "$p" = "$PPID" ]; then
+        continue
+      fi
+      # 读 cmdline：必须真的是 node 在跑 dist/index.js
+      cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || echo "")
+      case "$cmd" in
+        *node*dist/index.js*)
+          pid="$p"
+          break
+          ;;
+      esac
+    done
+  fi
+
+  # 不用 `[ -n "$pid" ] && echo`：条件为假返回 1 会让 set -e 的调用方静默退出
+  if [ -n "$pid" ]; then
+    echo "$pid"
+  fi
+  return 0
+}
+
+# 获取本机 WSL IP（供 Windows 侧访问）
+wsl_ip() {
+  hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+# ---------------- 启动（前台） ----------------
+cmd_run() {
+  check_ready
+  mkdir -p data
+
+  if is_running; then
+    echo "⚠️  服务已在运行 (PID $(cat "$PID_FILE"))"
+    echo "   如需重启: mimoapi restart"
+    exit 0
+  fi
+
+  local ip
+  ip=$(wsl_ip)
+
+  echo ""
+  echo "  ╔══════════════════════════════════════════════════╗"
+  echo "  ║          MiMo 反向代理 · WSL                      ║"
+  echo "  ╚══════════════════════════════════════════════════╝"
+  echo ""
+  echo "  WSL 内访问:     http://127.0.0.1:${PORT}/admin"
+  echo "  Windows 访问:   http://localhost:${PORT}/admin"
+  [ -n "$ip" ] && echo "  局域网访问:     http://${ip}:${PORT}/admin"
+  echo ""
+  echo "  按 Ctrl+C 停止服务"
+  echo ""
+
+  PORT="$PORT" exec node dist/index.js
+}
+
+# ---------------- 后台启动 ----------------
+cmd_start() {
+  check_ready
+  mkdir -p data
+
+  if is_running; then
+    echo "✅ 服务已在运行 (PID $(cat "$PID_FILE" 2>/dev/null))"
+    local ip
+    ip=$(wsl_ip)
+    echo ""
+    echo "   管理面板:   http://localhost:${PORT}/admin"
+    [ -n "$ip" ] && echo "   局域网:     http://${ip}:${PORT}/admin"
+    echo ""
+    echo "   如需重启: mimoapi restart"
+    return 0
+  fi
+
+  # 端口被别的进程占用（非本服务）
+  local occupied
+  occupied=$(find_port_pid)
+  if [ -n "$occupied" ]; then
+    echo "❌ 端口 $PORT 已被占用 (PID $occupied)"
+    echo ""
+    echo "   如确认要结束它:  kill $occupied"
+    echo "   或换端口启动:    PORT=9000 mimoapi start"
+    return 1
+  fi
+
+  # 用 setsid 完全脱离终端启动。
+  #
+  # 重要：WSL 在最后一个交互会话退出时会回收后台进程，
+  # 普通的 `nohup ... &` 仍会随会话结束而终止。
+  # setsid 创建独立会话 + 重定向所有标准流，才能让进程常驻。
+  setsid nohup node dist/index.js >>"$LOG_FILE" 2>&1 < /dev/null &
+  local pid=$!
+  echo "$pid" > "$PID_FILE"
+
+  sleep 3
+  if kill -0 "$pid" 2>/dev/null; then
+    local ip
+    ip=$(wsl_ip)
+    echo "✅ 服务已后台启动 (PID $pid)"
+    echo ""
+    echo "   管理面板:   http://localhost:${PORT}/admin"
+    [ -n "$ip" ] && echo "   局域网:     http://${ip}:${PORT}/admin"
+    echo "   日志:       mimoapi logs"
+    echo "   停止:       mimoapi stop"
+  else
+    echo "❌ 启动失败，日志如下:"
+    tail -20 "$LOG_FILE"
+    rm -f "$PID_FILE"
+    return 1
+  fi
+}
+
+# ---------------- 停止 ----------------
+cmd_stop() {
+  # 收集需要结束的 PID（PID 文件 + 端口探测）
+  local pids=""
+  if [ -f "$PID_FILE" ]; then
+    pids=$(cat "$PID_FILE" 2>/dev/null || echo "")
+  fi
+  local port_pid
+  port_pid=$(find_port_pid)
+  if [ -n "$port_pid" ]; then
+    pids="$pids $port_pid"
+  fi
+  # 去重
+  pids=$(echo "$pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)
+
+  if [ -z "$pids" ]; then
+    echo "ℹ️  服务未在运行"
+    rm -f "$PID_FILE"
+    return 0
+  fi
+
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "正在停止 (PID $pid)..."
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+
+  # 等待退出
+  for _ in $(seq 1 12); do
+    local alive=""
+    for pid in $pids; do
+      kill -0 "$pid" 2>/dev/null && alive="yes"
+    done
+    [ -z "$alive" ] && break
+    sleep 0.5
+  done
+
+  # 强制结束残留
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "   强制结束 PID $pid"
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+
+  rm -f "$PID_FILE"
+  echo "✅ 已停止"
+}
+
+# ---------------- 状态 ----------------
+cmd_status() {
+  if is_running; then
+    local pid ip
+    pid=$(cat "$PID_FILE")
+    ip=$(wsl_ip)
+    echo "✅ 服务运行中 (PID $pid)"
+    echo ""
+    echo "   管理面板:   http://localhost:${PORT}/admin"
+    [ -n "$ip" ] && echo "   局域网:     http://${ip}:${PORT}/admin"
+    echo ""
+    echo "   健康检查:   curl -s http://127.0.0.1:${PORT}/health"
+  else
+    echo "⛔ 服务未运行"
+    echo "   启动: mimoapi start"
+  fi
+}
+
+# ---------------- 日志 ----------------
+cmd_logs() {
+  if [ ! -f "$LOG_FILE" ]; then
+    echo "ℹ️  暂无日志文件"
+    return 0
+  fi
+  tail -n "${1:-40}" -f "$LOG_FILE"
+}
+
+# ---------------- 构建 ----------------
+cmd_build() {
+  echo "==> 安装依赖"
+  npm install --no-audit --no-fund
+  echo ""
+  echo "==> 构建"
+  npm run build
+  echo ""
+  echo "✅ 构建完成"
+}
+
+# ---------------- 从 Windows 同步并重建 ----------------
+cmd_update() {
+  if [ ! -d "$SRC_WIN" ]; then
+    echo "❌ 找不到源目录: $SRC_WIN"
+    exit 1
+  fi
+  echo "==> 从 Windows 同步代码"
+  rsync -a --delete \
+    --exclude 'node_modules' --exclude 'dist' --exclude 'data' \
+    --exclude '.npm-cache' --exclude '.npm-tmp' \
+    --exclude '*.db' --exclude '*.db-shm' --exclude '*.db-wal' \
+    "$SRC_WIN/" "$APP_DIR/"
+
+  echo "==> 重新构建"
+  cmd_build
+  echo ""
+  echo "ℹ️  如服务在运行，请执行: mimoapi restart"
+}
+
+# ---------------- 帮助 ----------------
+cmd_help() {
+  cat <<EOF
+
+  MiMo 反向代理 · 命令帮助
+
+  用法: mimoapi [命令]
+
+  命令:
+    (无)        前台启动（Ctrl+C 停止，推荐首次使用）
+    start       后台启动
+    stop        停止后台服务
+    restart     重启服务
+    status      查看运行状态与访问地址
+    logs        实时查看日志（Ctrl+C 退出）
+    build       重新安装依赖并构建
+    update      从 Windows 侧同步代码并重建
+    help        显示本帮助
+
+  访问地址:
+    WSL 内:     http://127.0.0.1:${PORT}/admin
+    Windows:    http://localhost:${PORT}/admin
+
+  环境变量:
+    PORT        监听端口（默认 8788）
+                例如: PORT=9000 mimoapi start
+
+EOF
+}
+
+# ---------------- 分发 ----------------
+case "${1:-run}" in
+  run|"")   cmd_run ;;
+  start)    cmd_start ;;
+  stop)     cmd_stop ;;
+  restart)  cmd_stop; sleep 1; cmd_start ;;
+  status)   cmd_status ;;
+  logs)     cmd_logs "${2:-40}" ;;
+  build)    cmd_build ;;
+  update)   cmd_update ;;
+  help|-h|--help) cmd_help ;;
+  *)
+    echo "❌ 未知命令: $1"
+    cmd_help
+    exit 1
+    ;;
+esac

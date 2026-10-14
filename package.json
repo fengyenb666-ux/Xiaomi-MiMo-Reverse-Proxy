@@ -1,0 +1,32 @@
+{
+  "name": "mimo-proxy",
+  "version": "1.0.0",
+  "description": "小米 MiMo AI 网页版反向代理 - OpenAI 兼容 API，支持多账号负载均衡",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch & node --watch dist/index.js",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "keywords": [
+    "mimo",
+    "xiaomi",
+    "openai",
+    "proxy",
+    "reverse-proxy"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "dependencies": {
+    "playwright-core": "^1.64.1",
+    "undici": "^8.12.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

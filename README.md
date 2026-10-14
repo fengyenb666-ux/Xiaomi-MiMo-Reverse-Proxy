@@ -267,6 +267,67 @@ node --experimental-strip-types src/index.ts
 
 ---
 
+## 工具调用（Tool Calling）
+
+MiMo 网页版接口**原生不支持** `tools` 参数，本代理用**提示词模拟**实现：
+
+```
+① 客户端传 tools 定义
+      ↓
+② 反代把工具 schema 注入系统提示词，教模型用固定 XML 格式调用
+      ↓
+③ 模型输出 <tool_call> XML
+      ↓
+④ 反代解析 XML → 转换成标准 tool_calls 结构返回
+      ↓
+⑤ 客户端收到结构化工具调用，正常执行
+```
+
+### 支持的工具格式
+
+**主格式（XML）**——提示词里约定的格式：
+
+```
+<tool_call>
+<function=glob>
+<parameter=pattern>src/**/*.ts</parameter>
+</function>
+</tool_call>
+```
+
+**容错格式**——模型有时会用 JSON：
+
+```json
+{"name": "glob", "arguments": {"pattern": "src/**/*.ts"}}
+```
+
+（代码块包裹或裸 JSON 都能识别）
+
+### 行为说明
+
+| 场景 | 返回 |
+|---|---|
+| 模型决定调用工具 | `finish_reason: "tool_calls"`，`message.tool_calls` 有值，`content` 为 `null` |
+| 模型直接回答 | `finish_reason: "stop"`，正常文本 |
+| 同时有正文和工具调用 | 正文放 `content`，工具调用放 `tool_calls` |
+
+**参数类型自动推断**：`42` → 数字、`true` → 布尔、`{...}` → 对象、其余为字符串。
+
+### 注意事项
+
+- 提示词模拟的**可靠性低于原生支持**。模型偶尔可能不按格式输出，此时会作为普通文本返回
+- 启用 `tools` 时，流式响应会**先缓冲完整回答再解析**（否则 XML 会被分片切碎），因此**首字节延迟略高**
+- 工具调用依赖模型的理解能力，复杂 schema 建议简化参数描述
+
+### 测试
+
+```bash
+node --experimental-strip-types test/tool-calls.test.ts   # 35 项
+node scripts/test-tools-e2e.mjs                           # 端到端
+```
+
+---
+
 ## 思考链（Thinking）
 
 MiMo 把推理过程**内联在正文中**（`<think>推理</think>答案`），
@@ -513,21 +574,27 @@ rm -f data/mimo.db data/mimo.db-shm data/mimo.db-wal
 ├── src/
 │   ├── index.ts            # HTTP 服务 + OpenAI 兼容路由 + 管理 API
 │   ├── db.ts               # SQLite 初始化、表结构与列迁移（node:sqlite）
-│   ├── accounts.ts         # 多账号管理、负载均衡、健康状态、cURL 解析
+│   ├── accounts.ts         # 多账号管理、主备调度、健康状态、cURL 解析
 │   ├── health.ts           # 账号健康检查轮询
 │   ├── capture.ts          # 浏览器自动抓取凭证（Playwright）
+│   ├── tools.ts            # 工具调用适配（提示词注入 + XML 解析）
 │   ├── logger.ts           # 请求日志（SQLite 持久化 + 聚合统计）
 │   └── mimo/
 │       ├── client.ts       # MiMo 上游客户端（模型抓取 + SSE 流）
 │       ├── serialize.ts    # 消息序列化 + 思考链状态机
 │       └── session.ts      # 会话保持（消息指纹匹配）
 ├── public/
-│   └── index.html          # 管理面板（账号/聊天测试/模型/日志/说明）
+│   └── index.html          # 管理面板（快速接入/账号/聊天/模型/日志）
 ├── test/
 │   ├── think-parser.test.ts       # 思考链解析测试（22 项）
-│   └── parse-credential.test.ts   # 凭证解析测试（16 项）
+│   ├── parse-credential.test.ts   # 凭证解析测试（16 项）
+│   └── tool-calls.test.ts         # 工具调用解析测试（35 项）
+├── scripts/                # 安装、部署、诊断与验证脚本
 ├── docs/
-│   └── 协议逆向报告.md      # 上游协议分析
+│   ├── 协议逆向报告.md      # 上游协议分析
+│   ├── WSL部署指南.md
+│   └── screenshots/        # 界面截图
+├── install.sh              # 一键安装
 └── data/
     └── mimo.db             # SQLite 数据库（自动生成，已 gitignore）
 ```
@@ -537,8 +604,16 @@ rm -f data/mimo.db data/mimo.db-shm data/mimo.db-wal
 ## 测试
 
 ```bash
-node --experimental-strip-types test/think-parser.test.ts
-node --experimental-strip-types test/parse-credential.test.ts
+# 单元测试（共 73 项）
+node --experimental-strip-types test/think-parser.test.ts      # 22 项：思考链分片解析
+node --experimental-strip-types test/parse-credential.test.ts  # 16 项：cURL/凭证解析
+node --experimental-strip-types test/tool-calls.test.ts        # 35 项：工具调用解析
+
+# 端到端（需服务运行中）
+node scripts/test-tools-e2e.mjs            # 工具调用
+node scripts/check-stream-health.mjs       # 流式健康
+node scripts/check-sse-format.mjs          # SSE 格式校验
+node scripts/final-acceptance.sh           # 完整验收
 ```
 
 ---

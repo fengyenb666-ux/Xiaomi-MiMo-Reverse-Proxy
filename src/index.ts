@@ -61,6 +61,16 @@ import {
 import { addLog, initLogger, listLogs, clearLogs, logStats, logDailyStats } from './logger.ts';
 import { closeDb, initDb } from './db.ts';
 import {
+  buildToolPrompt,
+  hasToolCall,
+  parseToolCalls,
+  stripToolCalls,
+  toStreamToolCallDelta,
+  toolCallNames,
+  type ParsedToolCall,
+  type ToolDefinition,
+} from './tools.ts';
+import {
   checkAllAccounts,
   getHealthConfig,
   getHealthRuntime,
@@ -152,6 +162,9 @@ interface OpenAIRequestBody {
   stream?: boolean;
   reasoning_effort?: string;
   strip_reasoning?: boolean;
+  /** 工具定义（OpenAI 格式），本代理用提示词模拟实现 */
+  tools?: ToolDefinition[];
+  tool_choice?: unknown;
   [key: string]: unknown;
 }
 
@@ -337,6 +350,36 @@ async function handleChatCompletions(
 }
 
 /* ------------------------------------------------------------------ */
+/* 工具调用辅助                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 把工具定义注入消息列表。
+ *
+ * 策略：追加到已有的 system 消息末尾；若没有 system 消息，
+ * 则在最前面插入一条。
+ */
+function injectToolPrompt(
+  messages: ChatMessage[],
+  tools: ToolDefinition[],
+): ChatMessage[] {
+  const prompt = buildToolPrompt(tools);
+  const out = [...messages];
+
+  const sysIdx = out.findIndex((m) => m.role === 'system');
+  if (sysIdx >= 0) {
+    out[sysIdx] = {
+      role: 'system',
+      content: `${out[sysIdx].content}\n\n${prompt}`,
+    };
+  } else {
+    out.unshift({ role: 'system', content: prompt });
+  }
+
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
 /* 单次请求（可被故障转移重试）                                        */
 /* ------------------------------------------------------------------ */
 
@@ -402,7 +445,19 @@ async function runChatOnce(
     const session = getOrCreateSession(picked.id, clientSessionId, rawMessages);
     const conversationId = session.conversationId;
 
-    const query = serializeMessages(rawMessages);
+    // ---- 工具调用：把 tools 定义注入提示词 ----
+    //
+    // MiMo 网页版不支持原生 tools 参数，因此把工具 schema 追加到系统提示词，
+    // 让模型按约定格式输出 <tool_call>，响应侧再解析回标准结构。
+    const tools = Array.isArray(body.tools) && body.tools.length
+      ? (body.tools as ToolDefinition[])
+      : null;
+
+    const messagesForUpstream: ChatMessage[] = tools
+      ? injectToolPrompt(rawMessages, tools)
+      : rawMessages;
+
+    const query = serializeMessages(messagesForUpstream);
     const gen = callMimo(picked, conversationId, query, {
       model: mimoModel,
       enableThinking,
@@ -459,6 +514,16 @@ async function runChatOnce(
       const parser = new ThinkParser();
       const safe = new SafeBuffer(24);
 
+      // 工具调用缓冲。
+      //
+      // 当客户端传了 tools 时，模型输出的 <tool_call> XML 必须被拦截并
+      // 转换成结构化 tool_calls，不能作为正文透传（否则客户端无法执行）。
+      // 因此这里缓存正文，在结束时统一判断：
+      //   - 纯工具调用 → 只返回 tool_calls
+      //   - 正文 + 工具调用 → 正文照常，工具调用结构化返回
+      let answerBuffer = '';
+      const useTools = !!tools;
+
       for await (const chunk of gen) {
         if (aborted) break;
 
@@ -474,15 +539,45 @@ async function runChatOnce(
           }
 
           if (content) {
-            const emit = safe.push(content);
-            if (emit) send({ content: emit });
+            if (useTools) {
+              // 有工具调用场景：先缓冲，结束时统一处理
+              answerBuffer += content;
+            } else {
+              const emit = safe.push(content);
+              if (emit) send({ content: emit });
+            }
           }
         } else if (chunk.type === 'usage') {
           usage = chunk.usage;
         } else if (chunk.type === 'finish') {
-          // 冲掉安全缓冲
-          const tail = safe.flush();
-          if (tail) send({ content: tail });
+          if (useTools) {
+            // ---- 处理工具调用 ----
+            const calls = hasToolCall(answerBuffer)
+              ? parseToolCalls(answerBuffer)
+              : [];
+
+            if (calls.length) {
+              // 先输出正文（若有）
+              const textOnly = stripToolCalls(answerBuffer);
+              if (textOnly) send({ content: textOnly });
+
+              // 再输出结构化工具调用
+              console.log(
+                `[工具] 解析到 ${calls.length} 个调用: ${toolCallNames(calls).join(', ')}`,
+              );
+              send({ tool_calls: toStreamToolCallDelta(calls) }, 'tool_calls');
+
+              res.write('data: [DONE]\n\n');
+              finishSent = true;
+              continue;
+            }
+
+            // 没有工具调用：正文正常输出
+            if (answerBuffer) send({ content: answerBuffer });
+          } else {
+            const tail = safe.flush();
+            if (tail) send({ content: tail });
+          }
 
           // 结束帧。
           //
@@ -585,23 +680,46 @@ async function runChatOnce(
       }
     }
 
+    // ---- 工具调用解析（非流式）----
+    let toolCalls: ParsedToolCall[] = [];
+    if (tools && hasToolCall(finalText)) {
+      toolCalls = parseToolCalls(finalText);
+      if (toolCalls.length) {
+        console.log(
+          `[工具] 解析到 ${toolCalls.length} 个调用: ${toolCallNames(toolCalls).join(', ')}`,
+        );
+      }
+    }
+
+    // 有工具调用时，正文只保留非工具部分
+    const displayText = toolCalls.length ? stripToolCalls(finalText) : finalText;
+
     let message: Record<string, unknown> = {
       role: 'assistant',
-      content: sanitizeOutput(finalText),
+      content: sanitizeOutput(displayText),
     };
 
     if (stripReasoning) {
       message = {
         role: 'assistant',
-        content: stripThink(finalText),
+        content: stripThink(displayText),
       };
     } else if (THINK_MODE === 'separate' && reasoningText) {
       message = {
         role: 'assistant',
-        content: sanitizeOutput(finalText),
+        content: sanitizeOutput(displayText),
         reasoning_content: reasoningText,
       };
     }
+
+    // 附加结构化工具调用
+    if (toolCalls.length) {
+      message.tool_calls = toolCalls;
+      // OpenAI 规范：有工具调用时 content 通常为 null
+      if (!displayText.trim()) message.content = null;
+    }
+
+    const finishReason = toolCalls.length ? 'tool_calls' : 'stop';
 
     const usageObj = usage
       ? {
@@ -633,7 +751,7 @@ async function runChatOnce(
       object: 'chat.completion',
       created,
       model: mimoModel,
-      choices: [{ index: 0, message, finish_reason: 'stop' }],
+      choices: [{ index: 0, message, finish_reason: finishReason }],
       usage: usageObj,
     });
 

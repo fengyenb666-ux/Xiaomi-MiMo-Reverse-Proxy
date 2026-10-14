@@ -42,6 +42,8 @@
 | `verify-windows-deploy.mjs` | 从 Windows 侧验证 WSL 服务 |
 | `check-sse-format.mjs` | **SSE 格式检查**：逐帧分析流式输出是否合规 |
 | `check-stream-health.mjs` | **流式健康检查**：对比流式与非流式，定位挂起 |
+| `test-tools-e2e.mjs` | **工具调用端到端**：验证 XML → tool_calls 转换 |
+| `run-tools-test.sh` | 上面脚本的 WSL 包装 |
 | `rebuild-verify.sh` | 清理重建并校验产物含最新修复 |
 | `start-and-check.sh` | 启动服务并检查数据库状态 |
 | `run-render-check.sh` | 响应式检查的 WSL 包装（修正 PATH） |

@@ -87,6 +87,17 @@ const PROXY = process.env.MIMO_PROXY ?? '';
 const THINK_MODE = process.env.MIMO_THINK_MODE ?? 'separate'; // passthrough | strip | separate
 const SESSION_ISOLATION = process.env.MIMO_SESSION_ISOLATION ?? 'auto';
 
+/**
+ * 流式结束帧的 finish_reason 取值。
+ *
+ * 默认 `stop`。个别客户端只认 `stop`，也有客户端接受 `end_turn`；
+ * 可在此处统一调整。
+ */
+const FINISH_REASON = process.env.MIMO_FINISH_REASON ?? 'stop';
+
+/** 是否在流式响应中发送 usage 帧（默认发送；极端兼容场景可关闭） */
+const SEND_USAGE = process.env.MIMO_SEND_USAGE !== '0';
+
 /* ------------------------------------------------------------------ */
 /* 工具函数                                                            */
 /* ------------------------------------------------------------------ */
@@ -99,6 +110,9 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': '*',
     'Access-Control-Allow-Methods': '*',
+    // 兼容字段：与 OpenAI 响应保持一致，便于客户端正常处理
+    'openai-version': '2020-10-01',
+    'x-request-id': `req_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
   });
   res.end(payload);
 }
@@ -401,10 +415,14 @@ async function runChatOnce(
     if (isStream) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
         Connection: 'keep-alive',
         'X-Accel-Buffering': 'no',
         'Access-Control-Allow-Origin': '*',
+        // 兼容字段：部分客户端据此判断是 OpenAI 兼容服务
+        'openai-version': '2020-10-01',
+        'openai-processing-ms': '0',
+        'x-request-id': responseId,
       });
 
       const base = {
@@ -414,7 +432,19 @@ async function runChatOnce(
         model: mimoModel,
       };
 
+      // 注意：这些状态变量必须在 send() 定义之前声明。
+      // 否则 send() 内部引用它们时会命中 let 的暂时性死区（TDZ），
+      // 首次调用即抛 ReferenceError，导致流式响应头已发送但连接挂起。
+      let aborted = false;
+      let finishSent = false;
+      let chunkCount = 0;
+
+      req.on('close', () => {
+        aborted = true;
+      });
+
       const send = (delta: Record<string, unknown>, finish: string | null = null) => {
+        chunkCount++;
         res.write(
           `data: ${JSON.stringify({
             ...base,
@@ -428,10 +458,6 @@ async function runChatOnce(
 
       const parser = new ThinkParser();
       const safe = new SafeBuffer(24);
-      let aborted = false;
-      req.on('close', () => {
-        aborted = true;
-      });
 
       for await (const chunk of gen) {
         if (aborted) break;
@@ -458,31 +484,72 @@ async function runChatOnce(
           const tail = safe.flush();
           if (tail) send({ content: tail });
 
-          const usageObj = usage
-            ? {
-                prompt_tokens: usage.promptTokens,
-                completion_tokens: usage.completionTokens,
-                total_tokens: usage.totalTokens,
-                completion_tokens_details: { reasoning_tokens: usage.reasoningTokens },
-              }
-            : undefined;
-
+          // 结束帧。
+          //
+          // 兼容性要点：部分桌面客户端（Cherry Studio 等）在解析结束帧时，
+          // 若同一帧里带 usage 这种嵌套对象，会解析失败并把整个流判为
+          // "Stream ended without finish_reason"。因此这里**只发 finish_reason**，
+          // usage 放到紧随其后的独立帧（这也是 OpenAI 官方的做法）。
           res.write(
             `data: ${JSON.stringify({
               ...base,
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-              usage: usageObj,
+              choices: [{ index: 0, delta: {}, finish_reason: FINISH_REASON }],
             })}\n\n`,
           );
+
+          // usage 单独一帧（若客户端不需要可忽略；这是标准扩展行为）
+          if (usage && SEND_USAGE) {
+            res.write(
+              `data: ${JSON.stringify({
+                ...base,
+                choices: [],
+                usage: {
+                  prompt_tokens: usage.promptTokens,
+                  completion_tokens: usage.completionTokens,
+                  total_tokens: usage.totalTokens,
+                  completion_tokens_details: {
+                    reasoning_tokens: usage.reasoningTokens,
+                  },
+                },
+              })}\n\n`,
+            );
+          }
+
+          // 收尾帧：显式再发一次空的 finish_reason，
+          // 保证任何解析顺序下客户端都能读到结束标记
+          res.write(
+            `data: ${JSON.stringify({
+              ...base,
+              choices: [{ index: 0, delta: {}, finish_reason: FINISH_REASON }],
+            })}\n\n`,
+          );
+
           res.write('data: [DONE]\n\n');
+          finishSent = true;
         }
       }
 
-      if (aborted) {
-        res.end();
-      } else {
-        res.end();
+      // 上游流在没有 finish 事件的情况下结束（网络中断、上游异常等）。
+      // 此时必须补一个结束帧，否则客户端会报
+      // "Stream ended without finish_reason" 并重试。
+      if (!finishSent && !aborted) {
+        console.warn(
+          `[流式] 上游未发送 finish 事件，补发结束帧` +
+            `（已输出 ${chunkCount} 帧）`,
+        );
+        const tail = safe.flush();
+        if (tail) send({ content: tail });
+        res.write(
+          `data: ${JSON.stringify({
+            ...base,
+            choices: [{ index: 0, delta: {}, finish_reason: FINISH_REASON }],
+          })}\n\n`,
+        );
+        res.write('data: [DONE]\n\n');
+        finishSent = true;
       }
+
+      res.end();
 
       if (usage) updateSessionTokens(session.id, usage.promptTokens);
 
@@ -810,12 +877,31 @@ async function handleAdmin(
 
     const accounts = listAccounts();
 
+    // 推荐模型：优先用上游列表里标记 isNew 的，否则用默认型号
+    let recommendedModel = DEFAULT_MODEL;
+    let availableModels: string[] = [];
+    try {
+      const models = await fetchChatModels(PROXY || undefined);
+      availableModels = models.map((m) => m.model);
+      const newest = models.find((m) => m.isNew && !m.redirectTo);
+      if (newest) recommendedModel = newest.model;
+      else if (availableModels.length) recommendedModel = availableModels[0];
+    } catch {
+      /* 上游不可用时回退默认值 */
+    }
+
+    const activeAccounts = accounts.filter((a) => a.isActive);
+
     return json(res, 200, {
       baseUrl: `http://${host}/v1`,
       chatUrl: `http://${host}/v1/chat/completions`,
       modelsUrl: `http://${host}/v1/models`,
       lanUrls: lanIps.map((ip) => `http://${ip}:${PORT}/v1`),
       port: PORT,
+      // 直接可用的推荐配置
+      recommendedModel,
+      modelCount: availableModels.length,
+      activeCount: activeAccounts.length,
       keys: accounts.map((a) => ({
         id: a.id,
         alias: a.alias,
@@ -824,6 +910,7 @@ async function handleAdmin(
         userId: a.userId,
         requestCount: a.requestCount,
         errorCount: a.errorCount,
+        priority: a.priority,
       })),
     });
   }

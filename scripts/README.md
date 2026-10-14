@@ -35,9 +35,17 @@
 | `final-acceptance.sh` | 完整验收：环境 / 接口 / 数据库 / UI / 单元测试 |
 | `test-health-e2e.sh` | 健康检查端到端测试 |
 | `test-autodisable.sh` | 连续失败自动停用测试 |
+| `test-failover.sh` | 主备切换测试（优先级排序、失败转移） |
 | `verify-health.sh` | 校验数据库表结构与列迁移 |
+| `verify-redesign.mjs` | 视觉验证：多视口截图 + 设计令牌核对 |
 | `verify-responsive-render.mjs` | 多视口渲染验证（检测横向溢出并截图） |
-| `run-render-check.sh` | 上面脚本的 WSL 包装（修正 PATH） |
+| `verify-windows-deploy.mjs` | 从 Windows 侧验证 WSL 服务 |
+| `check-sse-format.mjs` | **SSE 格式检查**：逐帧分析流式输出是否合规 |
+| `check-stream-health.mjs` | **流式健康检查**：对比流式与非流式，定位挂起 |
+| `rebuild-verify.sh` | 清理重建并校验产物含最新修复 |
+| `start-and-check.sh` | 启动服务并检查数据库状态 |
+| `run-render-check.sh` | 响应式检查的 WSL 包装（修正 PATH） |
+| `run-redesign-check.sh` | 视觉验证的 WSL 包装 |
 
 ---
 
@@ -55,6 +63,10 @@ bash scripts/final-acceptance.sh
 
 # 检查响应式布局
 bash scripts/run-render-check.sh
+
+# 排查流式输出问题
+node scripts/check-stream-health.mjs   # 先定位是否挂起
+node scripts/check-sse-format.mjs      # 再检查帧格式
 
 # WSL localhost 访问不了时
 node scripts/wsl-forward.mjs

@@ -447,6 +447,106 @@
     max-width: 100%;
   }
 
+  /* ---------- 快速接入 ---------- */
+  .quick-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+    gap: var(--gap-sm);
+    width: 100%;
+  }
+  .quick-item {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: clamp(12px, 1vw, 16px);
+    background: var(--card);
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .quick-label {
+    display: flex; align-items: center; gap: 8px;
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    color: var(--foreground);
+  }
+  .quick-num {
+    display: inline-flex;
+    align-items: center; justify-content: center;
+    width: 18px; height: 18px;
+    background: var(--primary);
+    color: var(--primary-foreground);
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: var(--radius);
+    flex-shrink: 0;
+  }
+  .quick-value {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: clamp(8px, 0.7vw, 11px) clamp(10px, 0.8vw, 14px);
+    cursor: pointer;
+    transition: background var(--dur-hover) var(--ease),
+                border-color var(--dur-hover) var(--ease);
+    min-width: 0;
+  }
+  .quick-value:hover {
+    background: var(--brand-bg);
+    border-color: var(--brand-text);
+  }
+  .quick-value code {
+    flex: 1 1 auto; min-width: 0;
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    color: var(--foreground);
+    overflow-x: auto;
+    white-space: nowrap;
+    user-select: all;
+    scrollbar-width: none;
+  }
+  .quick-value code::-webkit-scrollbar { display: none; }
+  .quick-copy {
+    flex-shrink: 0;
+    font-size: var(--fs-xs);
+    color: var(--muted-foreground);
+    border-left: 1px solid var(--border);
+    padding-left: 8px;
+  }
+  .quick-value:hover .quick-copy { color: var(--brand-text); }
+  .quick-hint {
+    font-size: var(--fs-xs);
+    color: var(--muted-foreground);
+    line-height: 1.6;
+  }
+  .quick-hint b { color: var(--foreground); font-weight: 600; }
+
+  .quick-details {
+    margin-top: var(--gap-sm);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: clamp(10px, 0.8vw, 14px) clamp(12px, 1vw, 16px);
+    background: var(--card);
+  }
+  .quick-details summary {
+    cursor: pointer;
+    font-size: var(--fs-sm);
+    font-weight: 500;
+    color: var(--muted-foreground);
+    user-select: none;
+    list-style: none;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .quick-details summary::-webkit-details-marker { display: none; }
+  .quick-details summary::before {
+    content: '▸';
+    font-size: 10px;
+    transition: transform var(--dur-hover) var(--ease);
+  }
+  .quick-details[open] summary::before { transform: rotate(90deg); }
+  .quick-details summary:hover { color: var(--foreground); }
+
   /* ---------- API 接入信息 ---------- */
   .api-grid {
     display: grid;
@@ -791,43 +891,85 @@
 
   <!-- 账号管理 -->
   <div id="tab-accounts">
-    <!-- API 接入信息 -->
-    <div class="card" style="border:2px solid var(--border)">
-      <div class="row" style="justify-content:space-between;margin-bottom:12px">
-        <h2 style="margin:0">🔌 API 接入信息</h2>
-        <button class="btn btn-sm" onclick="loadApiInfo()">刷新</button>
-      </div>
-
-      <div class="api-grid">
-        <div class="api-item">
-          <div class="api-label">Base URL（客户端填这个）</div>
-          <div class="api-value">
-            <code id="apiBase">加载中...</code>
-            <button class="btn btn-sm" onclick="copyText(document.getElementById('apiBase').textContent)">复制</button>
-          </div>
-        </div>
-        <div class="api-item">
-          <div class="api-label">对话接口</div>
-          <div class="api-value">
-            <code id="apiChat">-</code>
-            <button class="btn btn-sm" onclick="copyText(document.getElementById('apiChat').textContent)">复制</button>
-          </div>
+    <!-- 快速接入（可直接复制使用） -->
+    <div class="card" style="border:2px solid var(--primary)">
+      <div class="row" style="justify-content:space-between;margin-bottom:var(--gap-sm)">
+        <h2 style="margin:0">🚀 快速接入</h2>
+        <div class="row" style="gap:8px">
+          <button class="btn btn-sm" onclick="loadApiInfo()">刷新</button>
+          <button class="btn btn-sm btn-primary" onclick="copyAllConfig()">一键复制全部</button>
         </div>
       </div>
 
-      <div style="margin-top:16px">
-        <div class="api-label" style="margin-bottom:8px">API Key（每个账号一个，任选其一使用）</div>
-        <div class="table-wrap"><table>
-          <thead>
-            <tr><th>账号</th><th>API Key</th><th>状态</th><th>操作</th></tr>
-          </thead>
-          <tbody id="apiKeyRows">
-            <tr><td colspan="4" class="muted" style="text-align:center;padding:16px">加载中...</td></tr>
-          </tbody>
-        </table></div>
+      <p class="muted" style="margin-bottom:var(--gap-sm)">
+        下面三项直接填进你的 AI 客户端即可使用。点击任意一项可复制。
+      </p>
+
+      <!-- 三个核心字段：Base URL / API Key / 模型 -->
+      <div class="quick-grid">
+        <div class="quick-item">
+          <div class="quick-label">
+            <span class="quick-num">1</span> 接口地址
+          </div>
+          <div class="quick-value" onclick="copyText(document.getElementById('qBase').textContent)">
+            <code id="qBase">加载中...</code>
+            <span class="quick-copy">复制</span>
+          </div>
+          <div class="quick-hint">客户端里的 <b>Base URL</b> / <b>API 地址</b> 填这个</div>
+        </div>
+
+        <div class="quick-item">
+          <div class="quick-label">
+            <span class="quick-num">2</span> API Key
+          </div>
+          <div class="quick-value" onclick="copyText(document.getElementById('qKey').textContent)">
+            <code id="qKey">加载中...</code>
+            <span class="quick-copy">复制</span>
+          </div>
+          <div class="quick-hint">
+            客户端里的 <b>API Key</b> / <b>密钥</b> 填这个
+            <span id="qKeyCount"></span>
+          </div>
+        </div>
+
+        <div class="quick-item">
+          <div class="quick-label">
+            <span class="quick-num">3</span> 模型名称
+          </div>
+          <div class="quick-value" onclick="copyText(document.getElementById('qModel').textContent)">
+            <code id="qModel">加载中...</code>
+            <span class="quick-copy">复制</span>
+          </div>
+          <div class="quick-hint">
+            推荐用这个型号。全部可用模型见「模型列表」
+            <button class="btn btn-sm" style="margin-left:6px" onclick="switchTab('models')">查看全部</button>
+          </div>
+        </div>
       </div>
 
-      <div id="lanUrls" style="margin-top:14px"></div>
+      <!-- 一键复制的完整配置 -->
+      <details class="quick-details">
+        <summary>展开完整配置（可直接粘贴到配置文件）</summary>
+        <div style="margin-top:var(--gap-sm)">
+          <div class="row" style="justify-content:space-between;margin-bottom:6px">
+            <span class="api-label">JSON 格式</span>
+            <button class="btn btn-sm" onclick="copyText(document.getElementById('qJson').textContent)">复制 JSON</button>
+          </div>
+          <pre id="qJson">加载中...</pre>
+
+          <div class="row" style="justify-content:space-between;margin:var(--gap-sm) 0 6px">
+            <span class="api-label">环境变量格式</span>
+            <button class="btn btn-sm" onclick="copyText(document.getElementById('qEnv').textContent)">复制</button>
+          </div>
+          <pre id="qEnv">加载中...</pre>
+        </div>
+      </details>
+
+      <!-- 其他可用 Key -->
+      <div id="otherKeys" style="margin-top:var(--gap-sm)"></div>
+
+      <!-- 局域网地址 -->
+      <div id="lanUrls" style="margin-top:var(--gap-sm)"></div>
     </div>
 
     <div class="stats" id="stats"></div>
@@ -1335,49 +1477,118 @@ function copyText(t) {
   );
 }
 
-/** 加载 API 接入信息（地址 + Key） */
+/** 加载 API 接入信息（地址 + Key + 模型） */
 async function loadApiInfo() {
   try {
     const r = await fetch(API + '/admin/api-info');
     const d = await r.json();
 
-    document.getElementById('apiBase').textContent = d.baseUrl;
-    document.getElementById('apiChat').textContent = d.chatUrl;
+    // 推荐模型由后端给出（优先取上游标记为最新的型号）
+    const defaultModel = d.recommendedModel || 'mimo-v2.6-flash';
 
-    // 局域网地址
+    // 可用的活跃 Key（优先取启用的账号）
+    const activeKeys = (d.keys || []).filter(k => k.isActive);
+    const primaryKey = activeKeys[0]?.apiKey || d.keys?.[0]?.apiKey || '';
+
+    // ---------- 三项核心字段 ----------
+    document.getElementById('qBase').textContent = d.baseUrl;
+    document.getElementById('qKey').textContent = primaryKey || '（请先添加账号）';
+    document.getElementById('qModel').textContent = defaultModel;
+
+    // Key 数量提示
+    const keyCount = document.getElementById('qKeyCount');
+    if (keyCount) {
+      keyCount.innerHTML = activeKeys.length > 1
+        ? `　<span class="badge badge-off">共 ${activeKeys.length} 个可用</span>`
+        : '';
+    }
+
+    // ---------- 完整配置 ----------
+    const jsonCfg = {
+      base_url: d.baseUrl,
+      api_key: primaryKey,
+      model: defaultModel,
+    };
+    document.getElementById('qJson').textContent = JSON.stringify(jsonCfg, null, 2);
+
+    const envCfg = [
+      `OPENAI_BASE_URL=${d.baseUrl}`,
+      `OPENAI_API_KEY=${primaryKey}`,
+      `OPENAI_MODEL=${defaultModel}`,
+    ].join('\n');
+    document.getElementById('qEnv').textContent = envCfg;
+
+    // ---------- 其他可用 Key ----------
+    const otherBox = document.getElementById('otherKeys');
+    if (activeKeys.length > 1) {
+      otherBox.innerHTML =
+        `<div class="api-label" style="margin-bottom:6px">其他可用 Key（${activeKeys.length - 1} 个）</div>` +
+        `<div class="table-wrap"><table><thead><tr>
+           <th>账号</th><th>API Key</th><th>操作</th>
+         </tr></thead><tbody>` +
+        activeKeys.slice(1).map(k => `
+          <tr>
+            <td>${esc(k.alias || k.userId || k.id.slice(0, 8))}</td>
+            <td><span class="key-cell" onclick="copyKey('${esc(k.apiKey)}')"
+                      title="点击复制">${esc(k.apiKey)}</span></td>
+            <td><button class="btn btn-sm" onclick="copyKey('${esc(k.apiKey)}')">复制</button></td>
+          </tr>`).join('') +
+        `</tbody></table></div>`;
+    } else if (d.keys?.length && !activeKeys.length) {
+      otherBox.innerHTML =
+        `<div class="keybox" style="border-left-color:var(--destructive)">
+           ⚠️ 所有账号均已停用，请到下方「账号列表」重新启用或重新添加账号。
+         </div>`;
+    } else {
+      otherBox.innerHTML = '';
+    }
+
+    // ---------- 局域网地址 ----------
     const lanBox = document.getElementById('lanUrls');
     if (d.lanUrls && d.lanUrls.length) {
-      lanBox.innerHTML = `<div class="api-label">局域网访问（手机 / 其他设备用）</div>` +
-        d.lanUrls.map(u => `<div class="api-value" style="margin-top:6px">
+      lanBox.innerHTML =
+        `<div class="api-label" style="margin-bottom:6px">局域网地址（手机 / 其他设备接入用）</div>` +
+        d.lanUrls.map(u => `
+          <div class="quick-value" style="margin-top:6px"
+               onclick="copyText('${esc(u)}')">
             <code>${esc(u)}</code>
-            <button class="btn btn-sm" onclick="copyText('${esc(u)}')">复制</button>
+            <span class="quick-copy">复制</span>
           </div>`).join('');
     } else {
       lanBox.innerHTML = '';
     }
-
-    // Key 表格
-    const tb = document.getElementById('apiKeyRows');
-    if (!d.keys.length) {
-      tb.innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center;padding:16px">' +
-        '暂无账号，请先添加账号后再使用 API</td></tr>';
-      return;
-    }
-    tb.innerHTML = d.keys.map(k => `
-      <tr>
-        <td>${esc(k.alias || k.userId || k.id.slice(0, 8))}</td>
-        <td><span class="key-cell" onclick="copyKey('${esc(k.apiKey)}')"
-                  title="点击复制">${esc(k.apiKey)}</span></td>
-        <td><span class="badge ${k.isActive ? 'badge-ok' : 'badge-off'}">${k.isActive ? '可用' : '停用'}</span></td>
-        <td>
-          <button class="btn btn-sm" onclick="copyKey('${esc(k.apiKey)}')">复制</button>
-          <button class="btn btn-sm" onclick="testKey('${esc(k.apiKey)}')">测试</button>
-        </td>
-      </tr>
-    `).join('');
   } catch (e) {
-    document.getElementById('apiBase').textContent = '加载失败: ' + e.message;
+    document.getElementById('qBase').textContent = '加载失败: ' + e.message;
   }
+}
+
+/** 一键复制完整配置 */
+async function copyAllConfig() {
+  const base = document.getElementById('qBase').textContent;
+  const key = document.getElementById('qKey').textContent;
+  const model = document.getElementById('qModel').textContent;
+
+  const text = [
+    '【MiMo 反代 · 接入配置】',
+    '',
+    `接口地址 (Base URL): ${base}`,
+    `API Key:             ${key}`,
+    `模型名称 (Model):    ${model}`,
+    '',
+    `测试命令:`,
+    `curl ${base}/chat/completions \\`,
+    `  -H "Authorization: Bearer ${key}" \\`,
+    `  -H "Content-Type: application/json" \\`,
+    `  -d '{"model":"${model}","messages":[{"role":"user","content":"你好"}]}'`,
+  ].join('\n');
+
+  copyText(text);
+}
+
+/** 切换到指定标签页 */
+function switchTab(name) {
+  const btn = document.querySelector(`.tab[data-tab="${name}"]`);
+  if (btn) btn.click();
 }
 
 /** 用指定 Key 发一次测试请求，并跳到聊天页 */

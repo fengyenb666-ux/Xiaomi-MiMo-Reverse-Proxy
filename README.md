@@ -471,6 +471,10 @@ rm -f data/mimo.db data/mimo.db-shm data/mimo.db-wal
 | `MIMO_THINK_MODE` | `separate` | 思考链模式 |
 | `MIMO_SESSION_ISOLATION` | `auto` | 会话隔离：`auto` / `manual` / `per-request` |
 | `MIMO_MAX_CONCURRENT` | `4` | 单账号最大并发 |
+| `MIMO_SELECT_MODE` | `primary` | 账号选择：`primary`（主备） / `balance`（负载均衡） |
+| `MIMO_MAX_FAILOVER` | `2` | 主备切换时最多重试几个账号（0-5） |
+| `MIMO_FINISH_REASON` | `stop` | 流式结束帧的 finish_reason |
+| `MIMO_SEND_USAGE` | `1` | 设为 `0` 关闭流式 usage 帧 |
 | `MIMO_CONTEXT_RESET_TOKENS` | `150000` | 超此 token 数重置会话 |
 | `MIMO_SESSION_TTL_HOURS` | `24` | 会话保留时长 |
 
@@ -540,6 +544,29 @@ node --experimental-strip-types test/parse-credential.test.ts
 ---
 
 ## 常见问题
+
+**Q: 客户端报 `Stream ended without finish_reason`？**
+
+这是**流式响应没有正常结束**的信号（客户端通常标记为 `TRANSPORT` 错误并自动重试）。
+
+已修复的两个原因：
+
+1. 结束帧曾与 `usage` 混在同一帧，严格客户端解析失败 → 现在拆成独立帧
+2. 上游中断时没有补发结束标记 → 现在会自动补发
+
+排查命令：
+
+```bash
+node scripts/check-stream-health.mjs   # 先看流式是否挂起
+node scripts/check-sse-format.mjs      # 再检查帧格式是否合规
+```
+
+若客户端仍然报错，可尝试调整结束行为：
+
+```bash
+MIMO_FINISH_REASON=stop  # 默认值，可改为 end_turn 试试
+MIMO_SEND_USAGE=0        # 完全关闭 usage 帧（极端兼容场景）
+```
 
 **Q: 点击「打开浏览器并抓取」后没反应？**
 

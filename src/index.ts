@@ -49,9 +49,11 @@ import {
   listAccounts,
   listHealthChecks,
   markAccountInactive,
+  moveAccountPriority,
   parseCredential,
   recordAccountError,
   releaseAccount,
+  setPrimaryAccount,
   updateAccount,
   upsertAccount,
   type Account,
@@ -201,28 +203,179 @@ async function handleChatCompletions(
     mimoModel = body.model || DEFAULT_MODEL;
   }
 
-  // 选账号（原子占用并发位）
-  const picked = acquireAccount();
-  if (!picked) {
-    const s = accountStats();
-    const reason =
-      s.total === 0
-        ? '尚未添加任何 MiMo 账号。'
-        : s.active === 0
-          ? `全部 ${s.total} 个账号均已停用（通常是小米账号凭证过期）。请到管理面板查看并重新登录。`
-          : `所有账号都已达到并发上限（每账号 ${s.maxConcurrentPerAccount}）。可稍后重试或调大 MIMO_MAX_CONCURRENT。`;
-
-    return json(res, 503, {
-      error: {
-        message: `无可用 MiMo 账号：${reason}`,
-        type: 'service_error',
-        accounts: s,
-      },
-    });
-  }
+  // ============ 主备模式：自动故障转移 ============
+  //
+  // 优先使用优先级最高的账号。若它在上游失败（凭证过期/网络错误），
+  // 自动停用它并**用下一个账号重试本次请求**，最多重试 N 次。
+  // 这样客户端不会因为某个账号掉线而收到错误。
+  const MAX_FAILOVER = Math.max(
+    0,
+    Math.min(5, Number(process.env.MIMO_MAX_FAILOVER ?? 2)),
+  );
 
   const startedAt = Date.now();
+  const attempted: string[] = [];
+  let lastError: { msg: string; status?: number; loginUrl?: string } | null = null;
+
+  for (let attempt = 0; attempt <= MAX_FAILOVER; attempt++) {
+    // 选账号（主备模式下即优先级最高的可用账号）
+    const picked = acquireAccount();
+
+    if (!picked) {
+      // 没有可用账号了
+      if (attempted.length) {
+        // 已经有账号失败过 → 返回最后一次的真实错误
+        break;
+      }
+      const s = accountStats();
+      const reason =
+        s.total === 0
+          ? '尚未添加任何 MiMo 账号。'
+          : s.active === 0
+            ? `全部 ${s.total} 个账号均已停用（通常是小米账号凭证过期）。请到管理面板查看并重新登录。`
+            : `所有账号都已达到并发上限（每账号 ${s.maxConcurrentPerAccount}）。可稍后重试或调大 MIMO_MAX_CONCURRENT。`;
+
+      return json(res, 503, {
+        error: {
+          message: `无可用 MiMo 账号：${reason}`,
+          type: 'service_error',
+          accounts: s,
+        },
+      });
+    }
+
+    attempted.push(picked.alias ?? picked.id.slice(0, 8));
+
+    const result = await runChatOnce(req, res, {
+      picked,
+      body,
+      rawMessages,
+      mimoModel,
+      enableThinking,
+      stripReasoning,
+      isStream,
+      ip,
+      startedAt,
+    });
+
+    // 成功：直接结束
+    if (result.ok) return;
+
+    // 失败：记录并决定是否切换账号重试
+    lastError = result.error ?? { msg: '未知错误' };
+
+    // 流式响应已经开始发送 → 无法重试，只能报错结束
+    if (result.headersSent) return;
+
+    // 客户端主动断开 → 不重试
+    if (result.clientClosed) return;
+
+    const isAuth = result.error?.status === 401 || result.error?.status === 403;
+    const isRetryable = isAuth || result.error?.status === 429 || result.error?.status === 502;
+
+    if (!isRetryable || attempt >= MAX_FAILOVER) {
+      break;
+    }
+
+    // 还有备用账号 → 打印切换日志并继续循环
+    console.warn(
+      `[故障转移] ${picked.alias ?? picked.id.slice(0, 8)} 失败` +
+        `（${result.error?.status ?? '网络错误'}），` +
+        (attempt < MAX_FAILOVER ? '尝试切换下一个账号...' : '已达最大重试次数'),
+    );
+  }
+
+  // ============ 所有尝试均失败 ============
+  const msg = lastError?.msg ?? '所有账号均请求失败';
+  const status = lastError?.status;
+  const loginUrl = lastError?.loginUrl;
+
+  const stats = accountStats();
+  const tried = attempted.length > 1 ? `（已尝试 ${attempted.length} 个账号）` : '';
+  const hint =
+    stats.active === 0
+      ? `所有账号均已失效${tried}，请到管理面板重新登录小米账号。`
+      : stats.active > 0
+        ? `已尝试 ${attempted.join(' → ')}，均失败。`
+        : null;
+
+  if (res.headersSent) {
+    try {
+      res.write(
+        `data: ${JSON.stringify({ error: { message: msg, type: 'api_error' } })}\n\n`,
+      );
+      res.write('data: [DONE]\n\n');
+    } catch {
+      /* ignore */
+    }
+    res.end();
+    return;
+  }
+
+  return json(res, 502, {
+    error: {
+      message: hint ? `${msg}\n\n${hint}` : msg,
+      type: status === 401 || status === 403 ? 'auth_error' : 'api_error',
+      ...(loginUrl ? { login_url: loginUrl } : {}),
+      attempted,
+    },
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 单次请求（可被故障转移重试）                                        */
+/* ------------------------------------------------------------------ */
+
+interface RunChatOptions {
+  picked: Account;
+  body: OpenAIRequestBody;
+  rawMessages: ChatMessage[];
+  mimoModel: string;
+  enableThinking: boolean;
+  stripReasoning: boolean;
+  isStream: boolean;
+  ip: string;
+  startedAt: number;
+}
+
+interface RunChatResult {
+  ok: boolean;
+  /** 响应头是否已发送（流式开始后无法重试） */
+  headersSent?: boolean;
+  /** 客户端是否主动断开 */
+  clientClosed?: boolean;
+  error?: { msg: string; status?: number; loginUrl?: string };
+}
+
+/**
+ * 执行一次对话请求。
+ *
+ * 成功返回 { ok: true }；失败返回错误详情供上层决定是否切换账号重试。
+ */
+async function runChatOnce(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  opts: RunChatOptions,
+): Promise<RunChatResult> {
+  const {
+    picked,
+    body,
+    rawMessages,
+    mimoModel,
+    enableThinking,
+    stripReasoning,
+    isStream,
+    ip,
+    startedAt,
+  } = opts;
+
   let usage: MimoUsage | null = null;
+  let clientClosed = false;
+
+  // 客户端断开标记（流式场景）
+  req.on('close', () => {
+    clientClosed = true;
+  });
 
   try {
     const clientSessionId = generateClientSessionId(
@@ -346,7 +499,8 @@ async function handleChatCompletions(
         totalTokens: usage?.totalTokens ?? 0,
         ip,
       });
-      return;
+
+      return { ok: true, headersSent: true, clientClosed: aborted };
     }
 
     // 非流式
@@ -407,7 +561,7 @@ async function handleChatCompletions(
       ip,
     });
 
-    return json(res, 200, {
+    json(res, 200, {
       id: responseId,
       object: 'chat.completion',
       created,
@@ -415,23 +569,18 @@ async function handleChatCompletions(
       choices: [{ index: 0, message, finish_reason: 'stop' }],
       usage: usageObj,
     });
+
+    return { ok: true, headersSent: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const status = (err as { status?: number }).status;
     const loginUrl = (err as { loginUrl?: string }).loginUrl;
 
-    // 鉴权失败 → 禁用账号，并记录重新登录地址
+    // 鉴权失败 → 立即停用账号（这样下一个请求会自动切换备用账号）
     if (status === 401 || status === 403) {
       markAccountInactive(picked.id, msg, loginUrl);
     }
     recordAccountError(picked.id, msg);
-
-    // 所有账号都失效时，给客户端更明确的提示
-    const stats = accountStats();
-    const hint =
-      stats.active === 0
-        ? '所有账号均已失效，请到管理面板重新登录小米账号并更新凭证。'
-        : null;
 
     addLog({
       accountId: picked.id,
@@ -448,29 +597,15 @@ async function handleChatCompletions(
       ip,
     });
 
-    if (res.headersSent) {
-      try {
-        res.write(
-          `data: ${JSON.stringify({ error: { message: msg, type: 'api_error' } })}\n\n`,
-        );
-        res.write('data: [DONE]\n\n');
-      } catch {
-        /* ignore */
-      }
-      res.end();
-      return;
-    }
-
-    return json(res, 502, {
-      error: {
-        message: hint ? `${msg}\n\n${hint}` : msg,
-        type: status === 401 || status === 403 ? 'auth_error' : 'api_error',
-        ...(loginUrl ? { login_url: loginUrl } : {}),
-      },
-    });
+    // 返回错误详情，由上层决定是否换账号重试
+    return {
+      ok: false,
+      headersSent: res.headersSent,
+      clientClosed,
+      error: { msg, status, loginUrl },
+    };
   } finally {
     releaseAccount(picked.id);
-    void startTime;
   }
 }
 
@@ -590,7 +725,7 @@ async function handleAdmin(
     const id = m[1];
     if (method === 'PATCH' || method === 'PUT') {
       const raw = await readBody(req);
-      let patch: { alias?: string | null; isActive?: boolean };
+      let patch: { alias?: string | null; isActive?: boolean; priority?: number };
       try {
         patch = JSON.parse(raw) as typeof patch;
       } catch {
@@ -602,8 +737,36 @@ async function handleAdmin(
     }
     if (method === 'DELETE') {
       const ok = deleteAccount(id);
-      return json(res, ok ? 200 : 404, { ok });
+      return json(res, 200, { ok });
     }
+  }
+
+  // POST /admin/accounts/:id/move —— 调整优先级顺序（主备模式）
+  const mv = pathname.match(/^\/admin\/accounts\/([^/]+)\/move$/);
+  if (mv && method === 'POST') {
+    const raw = await readBody(req);
+    let input: { direction?: 'up' | 'down' };
+    try {
+      input = JSON.parse(raw) as typeof input;
+    } catch {
+      return json(res, 400, { error: '无效的 JSON' });
+    }
+    if (input.direction !== 'up' && input.direction !== 'down') {
+      return json(res, 400, { error: 'direction 必须是 up 或 down' });
+    }
+    const ok = moveAccountPriority(mv[1], input.direction);
+    if (!ok) return json(res, 400, { error: '无法移动（已在首/末位）' });
+    return json(res, 200, { ok: true, accounts: listAccounts().map((a) => ({
+      id: a.id, alias: a.alias, priority: a.priority, isActive: a.isActive,
+    })) });
+  }
+
+  // POST /admin/accounts/:id/primary —— 设为主账号
+  const pm = pathname.match(/^\/admin\/accounts\/([^/]+)\/primary$/);
+  if (pm && method === 'POST') {
+    const ok = setPrimaryAccount(pm[1]);
+    if (!ok) return json(res, 404, { error: '账号不存在' });
+    return json(res, 200, { ok: true });
   }
 
   // GET /admin/logs

@@ -45,6 +45,14 @@ export function initDb(): DatabaseSync {
       error_count    INTEGER NOT NULL DEFAULT 0,
       last_error     TEXT,
       login_url      TEXT,
+      health_status  TEXT DEFAULT 'unknown',
+      last_checked_at TEXT,
+      last_ok_at     TEXT,
+      last_latency_ms INTEGER,
+      consecutive_failures INTEGER DEFAULT 0,
+      check_count    INTEGER DEFAULT 0,
+      source         TEXT DEFAULT 'manual',
+      priority       INTEGER DEFAULT 100,
       created_at     TEXT NOT NULL,
       last_used_at   TEXT
     );
@@ -90,8 +98,21 @@ export function initDb(): DatabaseSync {
     CREATE INDEX IF NOT EXISTS idx_health_time    ON health_checks(time DESC);
   `);
 
-  // 为旧库补充新增列
+  // 为旧库补充新增列。
+  //
+  // 必须在建索引之前执行：索引可能引用新增的列（如 priority），
+  // 若先建索引会因「列不存在」直接报错，导致整个初始化失败。
   migrateColumns(db);
+
+  // 依赖新列的索引，放在迁移之后创建
+  try {
+    db.exec(
+      'CREATE INDEX IF NOT EXISTS idx_accounts_priority ON accounts(priority, created_at)',
+    );
+  } catch (err) {
+    // 索引创建失败不应阻止服务启动
+    console.warn('[数据库] 创建 priority 索引失败:', err);
+  }
 
   console.log(`[数据库] 已就绪: ${DB_FILE}`);
   return db;
@@ -114,6 +135,8 @@ function migrateColumns(database: DatabaseSync): void {
     ['check_count', 'INTEGER DEFAULT 0'],
     // 来源标记
     ['source', "TEXT DEFAULT 'manual'"], // manual | capture
+    // 优先级（主备模式：数字越小越优先）
+    ['priority', 'INTEGER DEFAULT 100'],
   ];
 
   const cols = new Set(

@@ -1,42 +1,193 @@
 # MiMo 反向代理
 
-把**小米 MiMo AI Studio 网页版**包装成本地 **OpenAI 兼容 API**，支持多账号登录与负载均衡。
+把**小米 MiMo AI Studio 网页版**包装成本地 **OpenAI 兼容 API**，支持多账号与主备自动切换。
 可以在 Cursor、Continue、Open WebUI、ChatBox 等任意支持 OpenAI 协议的工具中直接使用。
 
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-brightgreen)](https://nodejs.org)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-CC0%201.0-lightgrey)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178c6)](https://www.typescriptlang.org)
+
+---
+
+## 使用方法
+
+### 一行命令安装（WSL / Linux）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fengyenb666-ux/Xiaomi-MiMo-Reverse-Proxy/main/install.sh | bash -s -- \
+  --repo https://github.com/fengyenb666-ux/Xiaomi-MiMo-Reverse-Proxy.git
+```
+
+已克隆到本地时：
+
+```bash
+bash install.sh --source "$(pwd)"
+```
+
+脚本会自动完成：装 Node → 拉源码 → 装依赖 → 构建 → 装 Chromium → 配置 `mimoapi` 命令。
+
+### 启动服务
+
+```bash
+mimoapi            # 前台启动（Ctrl+C 停止）
+mimoapi start      # 后台启动（可关终端）
+mimoapi status     # 查看状态与访问地址
+mimoapi stop       # 停止
+mimoapi restart    # 重启
+mimoapi logs       # 实时日志
+mimoapi help       # 全部命令
+```
+
+> 首次安装后若提示 `mimoapi: command not found`，执行一次 `source ~/.bashrc`
+> 或重开终端即可。
+
+### 打开管理面板
+
+浏览器访问：
+
+```
+http://localhost:8788/admin
+```
+
+> Windows 访问 WSL 里的服务无需端口转发，WSL2 的 localhost 转发会自动生效。
+
+### 添加小米账号
+
+**方式一：手动粘贴（推荐，最稳）**
+
+1. 在浏览器打开 <https://aistudio.xiaomimimo.com>，**登录小米账号**
+2. 按 `F12` → **Network** 面板
+3. 随便发一条消息，找到 `chat` 请求
+4. 右键 → **Copy as cURL**
+5. 面板 →「手动添加」→ 粘贴 → 点「添加账号」
+
+> ⚠️ **Chrome 130+ 注意**：新版 Chrome 在 Copy as cURL 时默认剥离 Cookie。
+> 请先在 DevTools → **设置(⚙️)** → **Preferences** 中勾选
+> **「Allow to generate HAR with sensitive data」**，再重新复制。
+
+**方式二：一键自动抓取**
+
+面板 →「打开浏览器并抓取」，在弹出的窗口里登录并发送一条消息，凭证自动入库。
+
+### 获取 API 地址与 Key
+
+面板顶部「**API 接入信息**」直接显示：
+
+| 项目 | 示例 |
+|---|---|
+| **Base URL** | `http://localhost:8788/v1` |
+| **API Key** | `sk-mimo-xxxxxxxx...`（点击复制） |
+| 局域网地址 | `http://192.168.x.x:8788/v1`（手机等其他设备用） |
+
+服务启动时控制台也会打印所有账号的 Key：
+
+```
+  ── 账号 API Key ──────────────────────────────────────
+  ✅ 我的账号
+     sk-mimo-1a2b3c4d5e6f...
+  ──────────────────────────────────────────────────────
+```
+
+### 在客户端里调用
+
+```bash
+curl -N http://localhost:8788/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <你的APIKey>" \
+  -d '{
+    "model": "mimo-v2.6-flash",
+    "messages": [{"role":"user","content":"你好"}],
+    "stream": true
+  }'
+```
+
+常见客户端填法：
+
+| 工具 | 配置 |
+|---|---|
+| **Cursor** | Settings → Models → OpenAI API Base: `http://localhost:8788/v1` |
+| **Continue** | config.json → `apiBase: "http://localhost:8788/v1"` |
+| **Open WebUI** | 设置 → 连接 → API Base URL: `http://localhost:8788/v1` |
+| **ChatBox** | 设置 → API 域名: `http://localhost:8788` |
+| **Python** | `OpenAI(base_url="http://localhost:8788/v1", api_key="你的Key")` |
+
+> API Key 是面板自动生成的，**与小米账号凭证无关**。
+> 每个账号一个 Key，客户端用任意一个即可。
+
+### 测试对话
+
+面板 →「**聊天测试**」标签页，可直接发消息验证：
+
+- 选择账号与模型
+- 切换流式 / 非流式
+- 勾选「思考链」查看推理过程（🧠 块可折叠）
+- 底部实时显示耗时与 token 消耗
+
+### 多账号与主备切换
+
+添加多个账号后，面板按**从上到下**的顺序使用：
+
+```
+1. 主账号       ← 优先使用
+2. 备用账号A    ← 主账号不可用时自动切换
+3. 备用账号B
+```
+
+- 用 **▲ ▼** 调整顺序，或点「**设为主**」把某账号提到最前
+- 主账号**凭证过期 / 停用 / 并发满**时，请求自动切到下一个
+- 可在「账号健康检查」关闭自动轮询，或调整检查间隔与失败阈值
 
 ---
 
 ## 界面预览
 
-桌面端（1920px）— 内容居中，API 信息与统计卡片自适应多列
+**棱角极简风**：全直角、黑白灰主调、细边框分隔、几何无衬线字体。
 
-![桌面端](docs/screenshots/desktop-1920.png)
+桌面端（1440px）
 
-平板（768px）— 自动降为 4 列统计、API 两列
+![桌面端](docs/screenshots/desktop-1440.png)
 
-![平板](docs/screenshots/tablet-768.png)
+平板（834px）
 
-手机（414px）— 单列堆叠，按钮全宽
+![平板](docs/screenshots/tablet-834.png)
 
-![手机](docs/screenshots/mobile-414.png)
+手机（390px）
+
+![手机](docs/screenshots/mobile-390.png)
+
+### 设计规范
+
+| 令牌 | 值 | 用途 |
+|---|---|---|
+| `--radius` | `0px` | **全部直角**（设计核心特征） |
+| `--primary` | `#18181b` | 主色（近黑） |
+| `--foreground` | `#09090b` | 正文 |
+| `--muted-foreground` | `#71717a` | 次要文字 |
+| `--muted` | `#f4f4f5` | 弱背景（表头、禁用） |
+| `--border` | `#e4e4e7` | 边框与分隔线 |
+| `--success` | `#10b981` | 在线、启用 |
+| `--destructive` | `#ef4444` | 错误、过期 |
+| `--brand` | `#2e1b9c` | 品牌强调 |
+| `--header-height` | `3.5rem` | 顶栏高度 |
+
+字号阶：48 / 36 / 24 / 20 / 18 / 16 / 14 / 12
+字体：Jost（几何无衬线）+ 中文回退
+动效：`cubic-bezier(.2,0,0,1)`，160ms
 
 ---
 
 ## 特性
 
-- ✅ **响应式界面**：百分比 + `clamp()` 流式布局，从手机到超宽屏自适应
+- ✅ **棱角极简界面**：全直角 + 黑白灰 + 细边框，响应式自适应
 - ✅ **一键自动抓取**：程序内调起浏览器，登录后自动捕获凭证，无需手动复制
 - ✅ **账号自动入库**：抓到的凭证直接存入数据库，同账号自动更新不重复
+- ✅ **主备切换**：优先用主账号，不可用时自动切到备用账号重试
 - ✅ **健康检查轮询**：定时主动探测账号在线状态，连续失败自动停用
 - ✅ **SQLite 持久化**：账号、日志、检查历史全部入库，重启不丢数据
 - ✅ **API 信息面板**：面板直接显示 Base URL 与各账号 Key，一键复制
 - ✅ **内置聊天测试**：面板里直接试对话，实时查看思考链与 token 消耗
 - ✅ **OpenAI 兼容**：`/v1/models`、`/v1/chat/completions`（流式 + 非流式）
-- ✅ **多账号 + 负载均衡**：自动选择最空闲账号，支持并发控制
-- ✅ **小米账号登录**：自动抓取或手动粘贴 cURL 两种方式
+- ✅ **独立 API Key**：每个账号自动生成面板 Key，与小米凭证解耦
 - ✅ **模型型号实时抓取**：直接读上游 `bot/config`，含别名跳转解析
 - ✅ **思考链三种模式**：`separate` / `passthrough` / `strip`
 - ✅ **会话保持**：消息指纹匹配，复用 conversationId，节省 token
@@ -46,22 +197,18 @@
 
 ---
 
-## 快速开始
-
-### 1. 安装依赖
+## 手动安装（不使用安装脚本）
 
 ```bash
+# 1. 安装依赖
 npm install
-```
 
-### 2. 构建并启动
-
-```bash
+# 2. 构建并启动
 npm run build
 npm start
 ```
 
-开发模式（免构建，直接跑 TS）：
+开发模式（免构建，直接跑 TypeScript，需 Node 22+）：
 
 ```bash
 node --experimental-strip-types src/index.ts
@@ -69,45 +216,10 @@ node --experimental-strip-types src/index.ts
 
 启动后：
 
-- API 地址：`http://127.0.0.1:8788/v1`
-- 管理面板：`http://127.0.0.1:8788/admin`
+- API 地址：`http://localhost:8788/v1`
+- 管理面板：`http://localhost:8788/admin`
 
-### 3. 添加小米账号
-
-#### 方式一：一键自动抓取（推荐）
-
-打开管理面板 <http://127.0.0.1:8788/admin>，点击 **「打开浏览器并抓取」**，然后：
-
-1. 程序会**自动弹出一个浏览器窗口**
-2. 在窗口里**登录你的小米账号**
-3. 进入对话页，**随便发一条消息**（这一步用于触发凭证捕获）
-4. 凭证被自动抓取并保存，面板会显示生成的 **API Key**
-
-全程无需手动复制任何东西。
-
-> **原理**：程序不逆向 token 生成算法（那样容易随上游更新失效），
-> 而是启动真实浏览器，**拦截页面自己发出的 `chat` 请求**，
-> 从中直接提取真实的 `serviceToken` / `userId` / `ph_token`。
-> 这种方式与上游前端行为完全一致，最稳定。
-
-**多个账号**：重复以上步骤即可（建议先在浏览器里退出登录再登录另一个账号）。
-每个账号会得到独立的 API Key，请求会自动在账号间轮询。
-
-#### 方式二：手动粘贴 cURL（备用）
-
-1. 浏览器打开 <https://aistudio.xiaomimimo.com>，**登录小米账号**
-2. 进入对话页，按 `F12` → **Network** 面板
-3. 随便发一条消息，找到 `chat` 请求
-4. 右键 → **Copy as cURL**
-5. 打开管理面板 → 粘贴到「手动添加」输入框 → 点「添加账号」
-
-> ⚠️ **Chrome 130+ 重要提示**
-> 新版 Chrome 在 "Copy as cURL" 时**默认剥离 Cookie**，会导致导入失败。
-> 请先在 DevTools → **设置(⚙️)** → **Preferences** 中勾选
-> **「Allow to generate HAR with sensitive data」**，再重新复制。
-> 若嫌麻烦，直接用方式一。
-
-#### 浏览器要求
+### 自动抓取的浏览器要求
 
 自动抓取需要本机安装 **Chrome** 或 **Edge**。程序会自动检测以下位置：
 
@@ -115,64 +227,15 @@ node --experimental-strip-types src/index.ts
 - `C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`
 - `%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe`
 - `C:\Program Files\Microsoft\Edge\Application\msedge.exe`
-- Playwright 自带 Chromium（若已安装）
+- `~/.local/chromium/chrome-linux/chrome`（Linux / WSL，由 `scripts/install-chromium.sh` 安装）
+- Playwright 自带 Chromium
 
-也可用环境变量 `MIMO_BROWSER_PATH` 显式指定浏览器路径。
+也可用环境变量 `MIMO_BROWSER_PATH` 显式指定。
 
-### 4. 获取 API 地址与 Key
-
-打开管理面板 <http://127.0.0.1:8788/admin>，页面**最上方**就是「🔌 API 接入信息」：
-
-- **Base URL** —— 客户端要填的地址（如 `http://127.0.0.1:8788/v1`）
-- **对话接口** —— 完整 endpoint
-- **API Key 列表** —— 每个账号一个 Key，**点击即可复制**
-- **局域网地址** —— 若需手机/其他设备接入，用这里的地址
-
-另外，**服务启动时控制台也会打印所有账号的 API Key**，方便直接复制：
-
-```
-  ── 账号 API Key ──────────────────────────────────────
-  ✅ 我的账号
-     sk-mimo-1a2b3c4d5e6f7g8h9i0j...
-  ──────────────────────────────────────────────────────
-```
-
-### 5. 测试对话
-
-管理面板 → **「💬 聊天测试」** 标签页，可以直接发消息验证：
-
-- 上方选择要使用的**账号**和**模型**
-- 可切换 **流式 / 非流式**
-- 勾选 **思考链** 开启推理，**显示思考过程** 控制是否展示 🧠 思考块（点击可折叠）
-- 底部实时显示 **耗时、prompt/completion/reasoning token 数**
-
-在「API 接入信息」里点某个 Key 的 **「测试」** 按钮，会直接跳到聊天页并选中该账号。
-
-### 6. 接入客户端
-
-```bash
-curl -N http://127.0.0.1:8788/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <你的APIKey>" \
-  -d '{
-    "model": "mimo-v2.6-pro",
-    "messages": [{"role":"user","content":"你好"}],
-    "stream": true
-  }'
-```
-
----
-
-## 客户端配置
-
-| 工具 | 配置 |
-|---|---|
-| **Cursor** | Settings → Models → OpenAI API Base: `http://127.0.0.1:8788/v1` |
-| **Continue** | config.json → `apiBase: "http://127.0.0.1:8788/v1"` |
-| **Open WebUI** | 设置 → 连接 → API Base URL: `http://127.0.0.1:8788/v1` |
-| **ChatBox** | 设置 → API 域名: `http://127.0.0.1:8788` |
-| **Python** | `OpenAI(base_url="http://127.0.0.1:8788/v1", api_key="你的Key")` |
-| **Node.js** | `new OpenAI({ baseURL: "http://127.0.0.1:8788/v1", apiKey: "你的Key" })` |
+> **自动抓取的原理**：程序不逆向 token 生成算法（那样容易随上游更新失效），
+> 而是启动真实浏览器，**拦截页面自己发出的 `chat` 请求**，
+> 从中直接提取真实的 `serviceToken` / `userId` / `ph_token`。
+> 这种方式与上游前端行为完全一致，最稳定。
 
 ---
 

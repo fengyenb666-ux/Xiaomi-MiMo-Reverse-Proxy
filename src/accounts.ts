@@ -46,6 +46,14 @@ export interface Account {
   /** 来源：manual（手动粘贴）| capture（浏览器抓取） */
   source: string;
 
+  /**
+   * 优先级：数字越小越优先。
+   *
+   * 主备模式下，代理固定使用优先级最高的可用账号，
+   * 只有它不可用时才切换到下一个。
+   */
+  priority: number;
+
   createdAt: string;
   lastUsedAt: string | null;
 }
@@ -70,6 +78,7 @@ interface AccountRow {
   consecutive_failures: number | null;
   check_count: number | null;
   source: string | null;
+  priority: number | null;
   created_at: string;
   last_used_at: string | null;
 }
@@ -101,6 +110,7 @@ function rowToAccount(r: AccountRow): Account {
     consecutiveFailures: r.consecutive_failures ?? 0,
     checkCount: r.check_count ?? 0,
     source: r.source ?? 'manual',
+    priority: r.priority ?? 100,
     createdAt: r.created_at,
     lastUsedAt: r.last_used_at,
   };
@@ -120,7 +130,10 @@ export function initAccounts(): void {
 
 export function listAccounts(): Account[] {
   const rows = getDb()
-    .prepare('SELECT * FROM accounts ORDER BY created_at DESC')
+    .prepare(
+      // 主备模式下这个顺序即「使用优先级」：靠前的先用
+      'SELECT * FROM accounts ORDER BY priority ASC, created_at ASC',
+    )
     .all() as unknown as AccountRow[];
   return rows.map(rowToAccount);
 }
@@ -161,6 +174,23 @@ export interface CreateAccountInput {
   alias?: string;
   /** 来源标记：manual | capture */
   source?: string;
+  /** 优先级：数字越小越优先（主备模式用），默认 100 */
+  priority?: number;
+}
+
+/**
+ * 计算新账号的优先级。
+ *
+ * 规则：取当前最大 priority + 10，让新账号**排到末尾**。
+ * 这样「主账号」始终是你最早添加/手动指定的那个，
+ * 新加的账号默认作为备用，符合主备模式的直觉。
+ */
+function nextPriority(): number {
+  const row = getDb()
+    .prepare('SELECT MAX(priority) AS mx FROM accounts')
+    .get() as { mx: number | null };
+  const mx = row.mx ?? 0;
+  return mx + 10;
 }
 
 /** 创建账号，返回含生成的 API Key 的账号 */
@@ -190,6 +220,8 @@ export function createAccount(input: CreateAccountInput): Account {
     consecutiveFailures: 0,
     checkCount: 0,
     source: input.source ?? 'manual',
+    // 未指定则排到末尾（作为备用账号）
+    priority: input.priority ?? nextPriority(),
     createdAt: now,
     lastUsedAt: null,
   };
@@ -199,8 +231,8 @@ export function createAccount(input: CreateAccountInput): Account {
       `INSERT INTO accounts
        (id, alias, service_token, user_id, ph_token, api_key, is_active,
         request_count, error_count, health_status, consecutive_failures,
-        check_count, source, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 1, 0, 0, 'unknown', 0, 0, ?, ?)`,
+        check_count, source, priority, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, 0, 0, 'unknown', 0, 0, ?, ?, ?)`,
     )
     .run(
       account.id,
@@ -210,6 +242,7 @@ export function createAccount(input: CreateAccountInput): Account {
       account.phToken,
       account.apiKey,
       account.source,
+      account.priority,
       account.createdAt,
     );
 
@@ -293,7 +326,7 @@ export function upsertAccount(input: CreateAccountInput): {
 
 export function updateAccount(
   id: string,
-  patch: { alias?: string | null; isActive?: boolean },
+  patch: { alias?: string | null; isActive?: boolean; priority?: number },
 ): Account | undefined {
   const existing = getAccountById(id);
   if (!existing) return undefined;
@@ -308,6 +341,16 @@ export function updateAccount(
   if (patch.isActive !== undefined) {
     sets.push('is_active = ?');
     vals.push(patch.isActive ? 1 : 0);
+    // 手动启用时，清空连续失败计数，让它重新参与调度
+    if (patch.isActive) {
+      sets.push('consecutive_failures = 0');
+      sets.push('health_status = ?');
+      vals.push('unknown');
+    }
+  }
+  if (patch.priority !== undefined) {
+    sets.push('priority = ?');
+    vals.push(Math.floor(patch.priority));
   }
 
   if (!sets.length) return existing;
@@ -318,6 +361,71 @@ export function updateAccount(
     .run(...vals);
 
   return getAccountById(id);
+}
+
+/**
+ * 调整账号顺序（主备模式下决定优先使用哪个）。
+ *
+ * 把所有账号按当前顺序重新编号（10, 20, 30...），
+ * 并交换目标账号与相邻账号的位置。
+ *
+ * @param id        要移动的账号
+ * @param direction 'up' 提高优先级 | 'down' 降低优先级
+ */
+export function moveAccountPriority(
+  id: string,
+  direction: 'up' | 'down',
+): boolean {
+  const list = listAccounts(); // 已按 priority, created_at 排序
+  const idx = list.findIndex((a) => a.id === id);
+  if (idx === -1) return false;
+
+  const swapIdx = direction === 'up' ? idx - 1 : idx + 1;
+  if (swapIdx < 0 || swapIdx >= list.length) return false;
+
+  // 交换两个账号
+  const arr = [...list];
+  [arr[idx], arr[swapIdx]] = [arr[swapIdx], arr[idx]];
+
+  // 重新编号（步长 10，便于以后插入）
+  // 注意：node:sqlite 没有 better-sqlite3 的 transaction() 包装，用显式 BEGIN/COMMIT
+  const db = getDb();
+  const stmt = db.prepare('UPDATE accounts SET priority = ? WHERE id = ?');
+  db.exec('BEGIN');
+  try {
+    arr.forEach((a, i) => stmt.run((i + 1) * 10, a.id));
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+
+  return true;
+}
+
+/**
+ * 把指定账号设为主账号（优先级最高）。
+ */
+export function setPrimaryAccount(id: string): boolean {
+  const list = listAccounts();
+  const target = list.find((a) => a.id === id);
+  if (!target) return false;
+
+  // 目标排最前，其余保持相对顺序
+  const arr = [target, ...list.filter((a) => a.id !== id)];
+
+  const db = getDb();
+  const stmt = db.prepare('UPDATE accounts SET priority = ? WHERE id = ?');
+  db.exec('BEGIN');
+  try {
+    arr.forEach((a, i) => stmt.run((i + 1) * 10, a.id));
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+
+  return true;
 }
 
 export function deleteAccount(id: string): boolean {
@@ -349,45 +457,111 @@ export function markAccountInactive(
 }
 
 /* ------------------------------------------------------------------ */
-/* 负载均衡                                                            */
+/* 账号选择：主备模式（failover）                                       */
 /* ------------------------------------------------------------------ */
 
 /** 单账号最大并发（可通过环境变量覆盖） */
 const MAX_CONCURRENT = Number(process.env.MIMO_MAX_CONCURRENT ?? 4);
 
 /**
- * 原子性地选择一个"最空闲"的可用账号并占用一个并发位。
+ * 选择模式：
+ *   primary（默认）—— 主备模式：固定优先使用优先级最高的账号，
+ *                     只有它不可用时（停用/并发满/连续失败）才切到下一个
+ *   balance         —— 负载均衡：选并发数最少的账号，请求分散到各账号
+ */
+type SelectMode = 'primary' | 'balance';
+
+function getSelectMode(): SelectMode {
+  const m = (process.env.MIMO_SELECT_MODE ?? 'primary').toLowerCase();
+  return m === 'balance' ? 'balance' : 'primary';
+}
+
+/**
+ * 账号可用性判断。
  *
- * 选择策略（在同一条 SQL 内完成，避免竞态）：
- *   并发数最少 → 累计请求数最少 → 创建时间最早
+ * 以下情况视为**不可用**，需要切换到备用账号：
+ *   - is_active = 0（被停用，通常是凭证过期）
+ *   - ph_token 为空（凭证不完整）
+ *   - 并发数已达上限
+ *   - 健康状态为 expired（凭证明确失效）
+ */
+function isUsable(a: Account): boolean {
+  if (!a.isActive) return false;
+  if (!a.phToken) return false;
+  if (a.healthStatus === 'expired') return false;
+  if ((inflight.get(a.id) ?? 0) >= MAX_CONCURRENT) return false;
+  return true;
+}
+
+/**
+ * 选取一个可用账号并占用一个并发位。
  *
- * 注意：并发计数在内存中维护，用 inflight 表参与排序需要在
- * JS 侧筛选后再排序，因此这里先取候选，再按内存计数排序。
- * 由于 Node 是单线程，acquire 的整个过程是原子的。
+ * **主备模式（默认）**：
+ *   按 priority 升序（数字小的优先）→ created_at 升序（先添加的优先）
+ *   取第一个可用账号。只有它不可用时才用下一个。
+ *
+ * **负载均衡模式**（MIMO_SELECT_MODE=balance）：
+ *   选并发数最少、累计请求最少的账号。
+ *
+ * Node 单线程执行，因此选取+占用并发位的过程是原子的。
  */
 export function acquireAccount(): Account | null {
+  const mode = getSelectMode();
+
   const rows = getDb()
     .prepare(
       `SELECT * FROM accounts
        WHERE is_active = 1 AND ph_token != ''
-       ORDER BY request_count ASC, created_at ASC`,
+       ORDER BY priority ASC, created_at ASC`,
     )
     .all() as unknown as AccountRow[];
 
-  const candidates = rows
-    .map(rowToAccount)
-    .filter((a) => (inflight.get(a.id) ?? 0) < MAX_CONCURRENT);
+  if (!rows.length) return null;
 
-  if (!candidates.length) return null;
+  const all = rows.map(rowToAccount);
+  const usable = all.filter(isUsable);
 
-  candidates.sort((x, y) => {
-    const cx = inflight.get(x.id) ?? 0;
-    const cy = inflight.get(y.id) ?? 0;
-    if (cx !== cy) return cx - cy;
-    return x.requestCount - y.requestCount;
-  });
+  if (!usable.length) {
+    // 全部不可用：区分原因便于上层给出准确提示
+    const busy = all.filter((a) => (inflight.get(a.id) ?? 0) >= MAX_CONCURRENT);
+    if (busy.length === all.length) {
+      console.warn(`[账号] 全部 ${all.length} 个账号均已达并发上限`);
+    }
+    return null;
+  }
 
-  const chosen = candidates[0];
+  let chosen: Account;
+
+  if (mode === 'primary') {
+    // 主备：直接取优先级最高的可用账号
+    chosen = usable[0];
+
+    // 记录发生了故障转移（便于排查）
+    const primary = all[0];
+    if (primary && primary.id !== chosen.id) {
+      const reason = !primary.isActive
+        ? '已停用'
+        : primary.healthStatus === 'expired'
+          ? '凭证过期'
+          : !primary.phToken
+            ? '凭证不完整'
+            : '并发已满';
+      console.log(
+        `[账号] 主账号 ${primary.alias ?? primary.id.slice(0, 8)} 不可用（${reason}），` +
+          `切换到 ${chosen.alias ?? chosen.id.slice(0, 8)}`,
+      );
+    }
+  } else {
+    // 负载均衡：并发最少 → 请求最少
+    usable.sort((x, y) => {
+      const cx = inflight.get(x.id) ?? 0;
+      const cy = inflight.get(y.id) ?? 0;
+      if (cx !== cy) return cx - cy;
+      return x.requestCount - y.requestCount;
+    });
+    chosen = usable[0];
+  }
+
   const next = (inflight.get(chosen.id) ?? 0) + 1;
   inflight.set(chosen.id, next);
 
